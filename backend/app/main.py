@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
-from app.db.session import engine
+from app.database.session import engine
 
 app = FastAPI(title="TrendLabs Reporting Tool")
 
