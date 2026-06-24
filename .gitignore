@@ -3,7 +3,7 @@ backend/__pycache__/
 backend/app/storage/
 frontend/node_modules/
 frontend/dist/
-.env
+backend/.env
 .idea/
 *.pyc
 *.log
