@@ -2,13 +2,13 @@
 -- 1. DATABASE CREATION
 -- ============================================================================
 
-DROP DATABASE IF EXISTS trendlabs_db;
+DROP DATABASE IF EXISTS trendlabs;
 
-CREATE DATABASE trendlabs_db
+CREATE DATABASE trendlabs
   CHARACTER SET utf8mb4
   COLLATE utf8mb4_unicode_ci;
 
-USE trendlabs_db;
+USE trendlabs;
 
 -- ============================================================================
 -- 2. TRELLO TABLES — DATA SYNCHRONIZED FROM TRELLO
@@ -42,17 +42,17 @@ CREATE TABLE lists (
   board_id INT NOT NULL COMMENT 'Parent board',
   name VARCHAR(255) NOT NULL COMMENT 'Exact Trello name (ex: In Progress, Done this Sprint)',
   workflow_stage ENUM(
-    'product_backlog',
-    'sprint_backlog',
-    'in_progress',
-    'waiting_validation',
-    'done_sprint',
-    'done_preprod',
-    'in_prod',
-    'waiting',
-    'feedback',
-    'retrospective',
-    'other'
+    'PRODUCT_BACKLOG',
+    'SPRINT_BACKLOG',
+    'IN_PROGRESS',
+    'WAITING_VALIDATION',
+    'DONE_SPRINT',
+    'DONE_PREPROD',
+    'IN_PROD',
+    'WAITING',
+    'FEEDBACK',
+    'RETROSPECTIVE',
+    'OTHER'
   ) NOT NULL COMMENT 'Normalized workflow stage',
   position FLOAT NULL COMMENT 'List position in board',
   is_archived BOOLEAN DEFAULT FALSE COMMENT 'TRUE if archived in Trello',

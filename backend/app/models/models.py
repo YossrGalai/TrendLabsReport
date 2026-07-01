@@ -15,17 +15,17 @@ from app.database.db import Base
 # ============================================================================
 
 class WorkflowStageEnum(str, PyEnum):
-    PRODUCT_BACKLOG = "product_backlog"
-    SPRINT_BACKLOG = "sprint_backlog"
-    IN_PROGRESS = "in_progress"
-    WAITING_VALIDATION = "waiting_validation"
-    DONE_SPRINT = "done_sprint"
-    DONE_PREPROD = "done_preprod"
-    IN_PROD = "in_prod"
-    WAITING = "waiting"
-    FEEDBACK = "feedback"
-    RETROSPECTIVE = "retrospective"
-    OTHER = "other"
+    PRODUCT_BACKLOG = "PRODUCT_BACKLOG"
+    SPRINT_BACKLOG = "SPRINT_BACKLOG"
+    IN_PROGRESS = "IN_PROGRESS"
+    WAITING_VALIDATION = "WAITING_VALIDATION"
+    DONE_SPRINT = "DONE_SPRINT"
+    DONE_PREPROD = "DONE_PREPROD"
+    IN_PROD = "IN_PROD"
+    WAITING = "WAITING"
+    FEEDBACK = "FEEDBACK"
+    RETROSPECTIVE = "RETROSPECTIVE"
+    OTHER = "OTHER"
 
 
 class LabelTypeEnum(str, PyEnum):
@@ -86,7 +86,7 @@ class List(Base):
     trello_id = Column(String(50), unique=True, nullable=False, index=True, comment="Trello list ID")
     board_id = Column(Integer, ForeignKey("boards.id", ondelete="CASCADE"), nullable=False, index=True, comment="Parent board")
     name = Column(String(255), nullable=False, comment="Exact Trello name")
-    workflow_stage = Column(Enum(WorkflowStageEnum), nullable=False, index=True, comment="Normalized workflow stage")
+    workflow_stage = Column(Enum(WorkflowStageEnum, values_callable=lambda obj: [e.value for e in obj]),nullable=False, index=True, comment="Normalized workflow stage")
     position = Column(Float, nullable=True, comment="List position in board")
     is_archived = Column(Boolean, default=False, comment="TRUE if archived in Trello")
 
@@ -133,7 +133,7 @@ class Label(Base):
     board_id = Column(Integer, ForeignKey("boards.id", ondelete="CASCADE"), nullable=False, index=True, comment="Parent board")
     name = Column(String(100), nullable=False, comment="Exact Trello name")
     color = Column(String(50), nullable=True, comment="Trello color")
-    label_type = Column(Enum(LabelTypeEnum), default=LabelTypeEnum.OTHER, nullable=False, index=True, comment="Type calculated at sync")
+    label_type = Column(Enum(LabelTypeEnum, values_callable=lambda obj: [e.value for e in obj]),default=LabelTypeEnum.OTHER, nullable=False, index=True, comment="Type calculated at sync")
     sprint_number = Column(Integer, nullable=True, index=True, comment="Sprint number if type=sprint")
 
     # Constraints
@@ -245,7 +245,7 @@ class CardHistory(Base):
     to_list_id = Column(Integer, ForeignKey("lists.id"), nullable=False, comment="Destination list")
     moved_at = Column(DateTime, nullable=False, index=True, comment="Exact event timestamp")
     action_trello_id = Column(String(50), unique=True, nullable=False, index=True, comment="Trello action ID (idempotence key)")
-    action_type = Column(Enum(ActionTypeEnum), nullable=False, index=True, comment="Action type")
+    action_type = Column(Enum(ActionTypeEnum, values_callable=lambda obj: [e.value for e in obj]),nullable=False, index=True, comment="Action type")
 
     __table_args__ = (
         Index("idx_card_id", "card_id"),
@@ -288,7 +288,7 @@ class SyncLog(Base):
     before_datetime = Column(DateTime, nullable=False, comment="Upper bound for Trello query")
     actions_fetched = Column(Integer, default=0, comment="Total actions fetched from API")
     cards_updated = Column(Integer, default=0, comment="Cards created or updated in DB")
-    status = Column(Enum(SyncStatusEnum), default=SyncStatusEnum.RUNNING, nullable=False, index=True, comment="Sync state")
+    status = Column(Enum(SyncStatusEnum, values_callable=lambda obj: [e.value for e in obj]), default=SyncStatusEnum.RUNNING, nullable=False, index=True, comment="Sync state")
     error_message = Column(Text, nullable=True, comment="Python error message if failed")
 
     __table_args__ = (
@@ -332,10 +332,10 @@ class ReportRun(Base):
     board_id = Column(Integer, ForeignKey("boards.id", ondelete="CASCADE"), nullable=False, index=True, comment="Board this report concerns")
     report_month = Column(Integer, nullable=False, comment="Report month (1-12)")
     report_year = Column(Integer, nullable=False, comment="Report year")
-    status = Column(Enum(ReportStatusEnum), default=ReportStatusEnum.PENDING, nullable=False, index=True, comment="Generation state")
+    status = Column(Enum(ReportStatusEnum, values_callable=lambda obj: [e.value for e in obj]), default=ReportStatusEnum.PENDING, nullable=False, index=True, comment="Generation state")
     file_path = Column(String(500), nullable=True, comment="Path to generated .xlsx file")
     generated_at = Column(DateTime, nullable=True, comment="Generation completion timestamp")
-    generated_by_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, comment="User who triggered generation")
+    generated_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, comment="User who triggered generation")
     error_message = Column(Text, nullable=True, comment="Error message if status=error")
 
     __table_args__ = (
