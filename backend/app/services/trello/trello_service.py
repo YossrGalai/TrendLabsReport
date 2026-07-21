@@ -69,7 +69,16 @@ class TrelloService:
     # ========================================================================
 
     def get_board_lists(self, board_id: str) -> List[Dict[str, Any]]:
-        return self._request("GET", f"boards/{board_id}/lists")
+        # filter=all (et pas le défaut "open") : une liste archivée sur Trello (ex: réorganisation
+        # du board) doit quand même être synchronisée avec son workflow_stage correct, puisque
+        # des cartes y sont passées historiquement et que card_history y référence encore cette
+        # liste via to_list_id. Sans ça, ces mouvements historiques ne peuvent jamais être
+        # rattachés à un stage, et une carte peut sembler "jamais terminée" alors qu'elle l'est.
+        return self._request(
+            "GET",
+            f"boards/{board_id}/lists",
+            params={"filter": "all"},
+        )
 
     def get_list_by_id(self, list_id: str) -> Dict[str, Any]:
         return self._request("GET", f"lists/{list_id}")
@@ -136,22 +145,25 @@ class TrelloService:
     # ========================================================================
 
     def get_board_labels(self, board_id: str) -> List[Dict[str, Any]]:
-        return self._request("GET", f"boards/{board_id}/labels",)
+        return self._request(
+            "GET",
+            f"boards/{board_id}/labels",
+            params={"fields": "all", "limit": "1000"},
+        )
 
     # ========================================================================
     # 6. ACTIONS (historique)
     # ========================================================================
 
-    def get_card_actions(self, card_id: str, action_types: Optional[str] = None, limit: int = 1000) -> List[Dict[str, Any]]:
+    def get_card_actions(self, card_id: str, action_types: Optional[str] = None, limit: int = 1000) -> List[
+        Dict[str, Any]]:
         params = {
             "fields": "all",
-            "limit": str(limit)
+            "limit": str(limit),
+            "memberCreator": "true",
+            "memberCreator_fields": "fullName,username",
         }
         if action_types:
             params["filter"] = action_types
 
-        return self._request(
-            "GET",
-            f"cards/{card_id}/actions",
-            params=params
-        )
+        return self._request("GET", f"cards/{card_id}/actions", params=params)

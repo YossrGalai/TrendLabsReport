@@ -1,15 +1,10 @@
-"""
-TESTS D'INTÉGRATION - Synchronisation Trello ↔ MySQL
-Lance ces tests pour vérifier que la synchronisation fonctionne correctement
-"""
-
 import pytest
 import logging
 from datetime import datetime
 
 from app.database.db import SessionLocal, engine, Base
 from app.services.trello.trello_service import TrelloService
-from services.sync.sync_service import TrelloSyncService
+from app.services.sync.sync_service import TrelloSyncService
 from app.models.models import (
     Board, List, Member, Label, Card, CardMember, CardLabel, CardHistory,
     WorkflowStageEnum, ActionTypeEnum

@@ -18,6 +18,7 @@ class WorkflowStageEnum(str, PyEnum):
     PRODUCT_BACKLOG = "PRODUCT_BACKLOG"
     SPRINT_BACKLOG = "SPRINT_BACKLOG"
     IN_PROGRESS = "IN_PROGRESS"
+    WAITING_QA = "WAITING_QA"
     WAITING_VALIDATION = "WAITING_VALIDATION"
     DONE_SPRINT = "DONE_SPRINT"
     DONE_PREPROD = "DONE_PREPROD"
@@ -151,6 +152,10 @@ class Label(Base):
     # Relationships
     board = relationship("Board", back_populates="labels")
     cards = relationship("Card", secondary="card_labels", back_populates="labels")
+    # Rapports générés pour ce label PROJECT (n'a de sens que si label_type == PROJECT,
+    # mais rien n'empêche au niveau SQL un autre type — la validation se fait côté service,
+    # cf. ExcelReportService.generate_monthly_report qui lève une ValueError sinon).
+    report_runs = relationship("ReportRun", back_populates="project_label")
 
     def __repr__(self):
         return f"<Label(id={self.id}, name='{self.name}', label_type={self.label_type})>"
@@ -174,8 +179,12 @@ class Card(Base):
     # Calculated from history
     created_at = Column(DateTime, nullable=True, comment="Real creation date (from createCard action)")
     started_at = Column(DateTime, nullable=True, index=True, comment="First move to in_progress (REPORT START)")
-    completed_at = Column(DateTime, nullable=True, index=True, comment="Last move to done_* (REPORT END)")
+    completed_at = Column(DateTime, nullable=True, index=True, comment="Last move to done_* (REPORT END), overridden by last_pr_comment_at when present")
     duration_working_days = Column(Integer, nullable=True, comment="Working days (Mon-Fri) between started_at and completed_at")
+    duration_real_seconds = Column(Integer, nullable=True, comment="Durée réelle (secondes) entre 1er passage en cours et passage en terminé, par les seuls propriétaires")
+
+    # Calculated from card_history commentCard actions (cf. _sync_card_history)
+    last_pr_comment_at = Column(DateTime, nullable=True, comment="Date of the last 'PR #.. created by ..' comment found on the card. When set, takes priority over the list-move-based completed_at, since it reflects the actual developer's work regardless of who later moves the card across lists (often the PO).")
 
     synced_at = Column(DateTime, default=datetime.utcnow, nullable=False, comment="Last sync timestamp")
 
@@ -246,6 +255,8 @@ class CardHistory(Base):
     moved_at = Column(DateTime, nullable=False, index=True, comment="Exact event timestamp")
     action_trello_id = Column(String(50), unique=True, nullable=False, index=True, comment="Trello action ID (idempotence key)")
     action_type = Column(Enum(ActionTypeEnum, values_callable=lambda obj: [e.value for e in obj]),nullable=False, index=True, comment="Action type")
+    actor_trello_id = Column(String(50), nullable=True, index=True, comment="Trello ID du memberCreator de l'action")
+    actor_full_name = Column(String(255), nullable=True, comment="Nom affiché de l'auteur (debug/audit)")
 
     __table_args__ = (
         Index("idx_card_id", "card_id"),
@@ -330,8 +341,16 @@ class ReportRun(Base):
 
     id = Column(Integer, primary_key=True, index=True, comment="Internal ID")
     board_id = Column(Integer, ForeignKey("boards.id", ondelete="CASCADE"), nullable=False, index=True, comment="Board this report concerns")
-    report_month = Column(Integer, nullable=False, comment="Report month (1-12)")
+    # Un rapport = un projet (label Trello de type PROJECT) au sein du board, plus tout le
+    # board — cf. ExcelReportService.generate_monthly_report(project_label_id=...). RESTRICT
+    # (et non CASCADE) pour ne pas perdre l'historique des rapports si le label est supprimé.
+    project_label_id = Column(Integer, ForeignKey("labels.id", ondelete="RESTRICT"), nullable=False, index=True, comment="PROJECT-type label this report concerns")
+    report_month = Column(Integer, nullable=False, comment="Report month (1-12) — étiquette de classement, cf. sprint_numbers pour le contenu réel")
     report_year = Column(Integer, nullable=False, comment="Report year")
+    # Les 4 numéros de sprint couvrant ce mois de reporting (ex: [31, 32, 33, 34]).
+    # Le filtrage réel des cartes se fait sur ces numéros (label SPRINT), pas sur des bornes
+    # de dates calendaires — cf. ExcelReportService._fetch_cards_for_sprints().
+    sprint_numbers = Column(JSON, nullable=False, comment="Les 4 numéros de sprint composant ce rapport")
     status = Column(Enum(ReportStatusEnum, values_callable=lambda obj: [e.value for e in obj]), default=ReportStatusEnum.PENDING, nullable=False, index=True, comment="Generation state")
     file_path = Column(String(500), nullable=True, comment="Path to generated .xlsx file")
     generated_at = Column(DateTime, nullable=True, comment="Generation completion timestamp")
@@ -343,19 +362,28 @@ class ReportRun(Base):
             "report_month >= 1 AND report_month <= 12",
             name="chk_report_month"
         ),
-        UniqueConstraint("board_id", "report_month", "report_year", name="uk_board_month_year"),
+        # Recalculée sur (board, PROJET, mois, année) : un même board/mois peut désormais
+        # avoir plusieurs rapports (un par projet), donc l'ancienne contrainte
+        # (board_id, month, year) seule empêcherait de générer le 2e projet du mois.
+        UniqueConstraint("board_id", "project_label_id", "report_month", "report_year", name="uk_board_project_month_year"),
         Index("idx_board_id", "board_id"),
+        Index("idx_project_label_id", "project_label_id"),
         Index("idx_report_month_year", "report_year", "report_month"),
         Index("idx_status", "status"),
     )
 
     # Relationships
     board = relationship("Board", back_populates="report_runs")
+    project_label = relationship("Label", back_populates="report_runs")
     user = relationship("User", back_populates="report_runs")
     snapshots = relationship("ReportSnapshot", back_populates="report_run", cascade="all, delete-orphan")
 
     def __repr__(self):
-        return f"<ReportRun(id={self.id}, board_id={self.board_id}, month={self.report_month}/{self.report_year}, status={self.status})>"
+        return (
+            f"<ReportRun(id={self.id}, board_id={self.board_id}, "
+            f"project_label_id={self.project_label_id}, "
+            f"month={self.report_month}/{self.report_year}, status={self.status})>"
+        )
 
 
 class ReportSnapshot(Base):

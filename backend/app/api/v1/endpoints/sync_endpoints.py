@@ -1,9 +1,3 @@
-"""
-ENDPOINTS DE SYNCHRONISATION
-Routes FastAPI pour tester et déclencher les syncs
-Ajouter ces endpoints à main.py
-"""
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import Dict, Any
@@ -146,8 +140,6 @@ def verify_sync_integrity(
         issues = []
         if cards_no_list > 0:
             issues.append(f"{cards_no_list} cards without list")
-        if labels_no_cards > 0:
-            issues.append(f"{labels_no_cards} labels without cards")
 
         return {
             "board_id": board.id,

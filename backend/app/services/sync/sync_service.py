@@ -1,14 +1,12 @@
-"""
-SYNC SERVICE - Synchronise les données Trello → MySQL
-Gère les relations, les doublons, et les mises à jour.
-"""
-
 import logging
 import re
-from datetime import datetime, timezone
+import unicodedata
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
+from zoneinfo import ZoneInfo
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from app.models.models import (
     ActionTypeEnum,
@@ -27,6 +25,26 @@ from app.services.trello.trello_service import TrelloService
 
 logger = logging.getLogger(__name__)
 
+PO_EXCLUDED_TRELLO_IDS: set[str] = {
+    "65cc7dadeb579736842299b9",
+}
+
+# Détecte les commentaires du type "PR #539 created by Aziz Ben Kbaier" (avec ou sans lien
+# Bitbucket juste après) — insensible à la casse. Volontairement large ("PR" + "#numéro" +
+# "created") pour couvrir les variantes de formulation sans matcher n'importe quel commentaire
+# mentionnant juste le mot "PR".
+PR_CREATED_COMMENT_RE = re.compile(r"\bPR\s*#\d+\s*(?:was\s+)?created\b", re.IGNORECASE)
+
+# Fuseau horaire de l'équipe, utilisé UNIQUEMENT pour juger de l'heure locale d'un passage de
+# carte (cf. _shift_early_morning_completion) — moved_at est stocké en UTC (cf. _parse_datetime).
+# À ajuster si l'équipe n'est pas basée en Tunisie.
+TEAM_TIMEZONE = ZoneInfo("Africa/Tunis")
+
+# Un passage vers un stage "terminé" avant cette heure LOCALE est considéré comme du travail de
+# la VEILLE — confirmé métier : un dev oublie souvent de déplacer sa carte le soir même et la
+# déplace seulement le lendemain matin en arrivant, ce qui compterait sinon une journée de
+# travail en plus qui n'a en réalité pas eu lieu.
+EARLY_MORNING_COMPLETION_CUTOFF_HOUR = 9
 
 class TrelloSyncService:
     """Service de synchronisation bidirectionnelle Trello ↔ MySQL"""
@@ -63,9 +81,19 @@ class TrelloSyncService:
             cards_count = self._sync_cards(db, board.id, board_id)
             logger.info(f"✅ {cards_count} cards synced")
 
+            # 5bis. Détecter les catégories-projet (carte 'Product Backlog')
+            #       et reclassifier les labels correspondants
+            project_names = self._sync_project_categories(db, board.id)
+            categories_updated = self._apply_project_categories(db, board.id, project_names)
+            logger.info(f"✅ {categories_updated} labels reclassifiés en PROJECT")
+
             # 6. Synchroniser l'historique des cartes
             history_count = self._sync_card_history(db, board_id)
             logger.info(f"✅ {history_count} history records synced")
+
+            # 7. Calculer started_at / completed_at / duration_working_days
+            dates_count = self._sync_card_dates(db, board.id)
+            logger.info(f"✅ {dates_count} card dates computed")
 
             # Update last_sync_at (Timezone-aware)
             board.last_sync_at = datetime.now(timezone.utc)
@@ -81,6 +109,8 @@ class TrelloSyncService:
                     "labels": labels_count,
                     "cards": cards_count,
                     "history": history_count,
+                    "dates_computed": dates_count,
+                    "project_categories_detected": len(project_names),
                 },
                 "sync_duration_seconds": (datetime.now(timezone.utc) - sync_start).total_seconds(),
                 "timestamp": sync_start.isoformat(),
@@ -134,7 +164,6 @@ class TrelloSyncService:
                 List.trello_id == trello_list_id
             ).first()
 
-            # On récupère directement le membre Enum correct
             workflow_stage = self._map_workflow_stage(trello_list.get("name", ""))
             is_archived_val = bool(trello_list.get("closed", False))
 
@@ -347,11 +376,32 @@ class TrelloSyncService:
         count = 0
         for card in cards:
             try:
-                trello_actions = self.trello.get_card_actions(card.trello_id)
+                trello_actions = self.trello.get_card_actions(
+                    card.trello_id,
+                    action_types="createCard,copyCard,updateCard,commentCard",
+                )
+
+                # Le dernier commentaire "PR #xxx created by ..." trouvé sur cette carte, tous
+                # membres confondus (contrairement aux déplacements de liste, on ne filtre PAS
+                # par propriétaire actuel ici : un PR posté par un dev qui a depuis quitté la
+                # carte reste un signal de complétion valide).
+                latest_pr_comment_at: Optional[datetime] = None
 
                 for action in trello_actions:
                     action_type = action.get("type")
                     action_trello_id = action.get("id")
+
+                    if action_type == "commentCard":
+                        comment_text = (action.get("data") or {}).get("text") or ""
+                        if PR_CREATED_COMMENT_RE.search(comment_text):
+                            comment_at = self._parse_datetime(action.get("date"))
+                            if comment_at and (latest_pr_comment_at is None or comment_at > latest_pr_comment_at):
+                                latest_pr_comment_at = comment_at
+                        # Les commentaires ne sont jamais persistés dans card_history : la
+                        # colonne to_list_id y est NOT NULL (une conversation n'a pas de liste
+                        # de destination) et on n'a pas besoin de les rejouer un par un, juste
+                        # de retenir la dernière date de PR trouvée (cf. plus bas).
+                        continue
 
                     existing_action = db.query(CardHistory).filter(
                         CardHistory.action_trello_id == action_trello_id
@@ -360,9 +410,13 @@ class TrelloSyncService:
                     if existing_action:
                         continue
 
+                    member_creator = action.get("memberCreator") or {}
+                    actor_trello_id = member_creator.get("id")
+                    actor_full_name = member_creator.get("fullName")
+
                     if action_type == "updateCard" and "data" in action:
                         card_data = action["data"].get("card", {})
-                        list_data = action["data"].get("list", {})
+                        list_data = action["data"].get("listAfter", {})
                         list_before = action["data"].get("listBefore", {})
 
                         if "idList" in card_data or list_before:
@@ -388,16 +442,16 @@ class TrelloSyncService:
                                     card_id=card.id,
                                     from_list_id=from_list_id,
                                     to_list_id=to_list_id,
-                                    moved_at=self._parse_datetime(
-                                        action.get("date")
-                                    ),
+                                    moved_at=self._parse_datetime(action.get("date")),
                                     action_trello_id=action_trello_id,
                                     action_type=ActionTypeEnum.UPDATE_CARD_LIST,
+                                    actor_trello_id=actor_trello_id,
+                                    actor_full_name=actor_full_name,
                                 )
                                 db.add(new_history)
                                 count += 1
 
-                    elif action_type == "createCard":
+                    elif action_type in ("createCard", "copyCard"):
                         to_list = db.query(List).filter(
                             List.trello_id == action["data"]["list"]["id"]
                         ).first()
@@ -407,14 +461,18 @@ class TrelloSyncService:
                                 card_id=card.id,
                                 from_list_id=None,
                                 to_list_id=to_list.id,
-                                moved_at=self._parse_datetime(
-                                    action.get("date")
-                                ),
+                                moved_at=self._parse_datetime(action.get("date")),
                                 action_trello_id=action_trello_id,
                                 action_type=ActionTypeEnum.CREATE_CARD,
+                                actor_trello_id=actor_trello_id,
+                                actor_full_name=actor_full_name,
                             )
                             db.add(new_history)
                             count += 1
+
+                if card.last_pr_comment_at != latest_pr_comment_at:
+                    card.last_pr_comment_at = latest_pr_comment_at
+                    count += 1
 
             except IntegrityError:
                 db.rollback()
@@ -423,6 +481,66 @@ class TrelloSyncService:
             except Exception as e:
                 logger.error(f"❌ Error syncing history for card {card.trello_id}: {e}")
                 continue
+
+        db.commit()
+        return count
+
+    def _sync_project_categories(self, db: Session, board_id: int) -> set:
+        """
+        Détecte les catégories-projet valides à partir des LABELS assignés à la
+        carte "Description" située dans la liste 'product_backlog' du board.
+
+        Doit être appelé APRÈS _sync_cards() (qui synchronise aussi card_labels),
+        donc cette carte et ses labels doivent déjà être en base.
+
+        Relu à CHAQUE synchronisation : si les labels de cette carte changent sur
+        Trello, la liste de catégories-projet suit automatiquement au prochain sync.
+        """
+        doc_card = (
+            db.query(Card)
+            .join(List, Card.list_id == List.id)
+            .filter(Card.board_id == board_id)
+            .filter(func.lower(func.replace(List.name, "_", " ")) == "product backlog")
+            .filter(func.lower(Card.name) == "description")
+            .first()
+        )
+
+        if not doc_card:
+            logger.warning(
+                "⚠️  Carte 'Description' dans la liste 'product_backlog' introuvable — "
+                "aucune catégorie-projet détectée, tous les labels resteront OTHER/SPRINT"
+            )
+            return set()
+
+        project_names = {label.name.strip().lower() for label in doc_card.labels}
+        logger.info(f"✅ {len(project_names)} catégories-projet détectées : {sorted(project_names)}")
+        return project_names
+
+    def _apply_project_categories(self, db: Session, board_id: int, project_names: set) -> int:
+        """
+        Applique label_type=PROJECT à tous les labels du board dont le nom
+        correspond à une catégorie détectée par _sync_project_categories().
+
+        Si un label était PROJECT avant mais ne fait plus partie de la liste
+        actuelle (retiré de la carte de doc sur Trello), il repasse en OTHER —
+        cohérent avec le principe "relu à chaque sync".
+        """
+        if not project_names:
+            return 0
+
+        labels = db.query(Label).filter(Label.board_id == board_id).all()
+        count = 0
+
+        for label in labels:
+            is_project = label.name.strip().lower() in project_names
+
+            if is_project and label.label_type != LabelTypeEnum.PROJECT:
+                label.label_type = LabelTypeEnum.PROJECT
+                label.sprint_number = None
+                count += 1
+            elif not is_project and label.label_type == LabelTypeEnum.PROJECT:
+                label.label_type = LabelTypeEnum.OTHER
+                count += 1
 
         db.commit()
         return count
@@ -437,8 +555,16 @@ class TrelloSyncService:
             return WorkflowStageEnum.OTHER
 
         name_lower = list_name.lower()
-        # Normaliser: remplacer underscores et espaces multiples par un seul espace
+        # Normaliser: remplacer underscores et espaces multiples par un seul espace, PUIS retirer
+        # les accents (é/è/à/ê... -> e/e/a/e...). Le retrait d'accents rend le mapping tolérant
+        # aux variantes orthographiques d'un même nom de liste renommé sur Trello au fil du temps
+        # (ex: liste historique "A vérifier / QA" renommée depuis en "Done / à vérifer" — notez
+        # le 'i' manquant dans 'vérifer' : sans retrait d'accent + radical court, "à vérifier"
+        # ne matche PAS "à vérifer", la liste retombe alors sur OTHER par défaut et son
+        # historique de mouvements devient invisible pour started_at/completed_at).
         name_normalized = re.sub(r'[\s_]+', ' ', name_lower).strip()
+        decomposed = unicodedata.normalize("NFKD", name_normalized)
+        name_normalized = "".join(c for c in decomposed if not unicodedata.combining(c))
 
         # Mapping flexible (gère l'anglais et le français du Trello)
         mapping = [
@@ -452,9 +578,14 @@ class TrelloSyncService:
             ("in progress", WorkflowStageEnum.IN_PROGRESS),
             ("en cours", WorkflowStageEnum.IN_PROGRESS),
 
+            # À vérifier / QA — radical "verif" (SANS accent ni terminaison) plutôt que le mot
+            # complet : matche "à vérifier", "a verifier", "vérifer" (variante sans le 'i'), et
+            # toute autre variante future du même mot, tant que le radical reste "verif".
+            ("verif", WorkflowStageEnum.WAITING_QA),
+            ("/ qa", WorkflowStageEnum.WAITING_QA),
+
             # Done / À valider / Waiting validation
             ("waiting validation", WorkflowStageEnum.WAITING_VALIDATION),
-            ("à valider", WorkflowStageEnum.WAITING_VALIDATION),
             ("a valider", WorkflowStageEnum.WAITING_VALIDATION),
 
             # Done Sprint / Fini ce sprint
@@ -463,7 +594,6 @@ class TrelloSyncService:
 
             # Done Preprod
             ("done preprod", WorkflowStageEnum.DONE_PREPROD),
-            ("préprod", WorkflowStageEnum.DONE_PREPROD),
             ("preprod", WorkflowStageEnum.DONE_PREPROD),
 
             # In Prod / En prod
@@ -473,6 +603,18 @@ class TrelloSyncService:
             # Autres
             ("feedback", WorkflowStageEnum.FEEDBACK),
             ("retrospective", WorkflowStageEnum.RETROSPECTIVE),
+            # "Stand By" est considérée côté métier comme une rétrospective (pas d'équivalent
+            # WAITING dédié pour cette liste) — confirmé explicitement, ne pas la faire tomber
+            # sur OTHER par défaut ni sur WAITING.
+            ("stand by", WorkflowStageEnum.RETROSPECTIVE),
+            # "Retours" est elle aussi considérée côté métier comme une rétrospective : une
+            # simple pause (pas un vrai retravail après complétion) — confirmé explicitement.
+            # Sans cette entrée, la liste tombait sur OTHER par défaut et son historique
+            # devenait invisible pour started_at/completed_at (cf. warning "No workflow stage
+            # mapped for 'Retours'").
+            # Radical "retour" (sans "s") plutôt que "retours" pour matcher aussi bien "Retour"
+            # que "Retours", par cohérence avec le radical "verif" plus haut.
+            ("retour", WorkflowStageEnum.RETROSPECTIVE),
             ("waiting", WorkflowStageEnum.WAITING),
         ]
 
@@ -486,7 +628,16 @@ class TrelloSyncService:
         return WorkflowStageEnum.OTHER
 
     def _parse_label_type(self, label_name: str) -> Tuple[LabelTypeEnum, Optional[int]]:
-        """Parse le nom du label → type + sprint_number"""
+        """Parse le nom du label → type + sprint_number.
+
+        Le fallback par défaut est MODULE (et non PROJECT) : sur ce board, les labels de
+        modules sont des noms métier libres ('AI', 'Application mobile', 'GYG', 'retour',
+        'demande client'...) sans mot-clé identifiable, donc ils tombent tous ici par
+        élimination. Ce n'est pas un problème pour les vrais labels PROJECT : ils sont
+        recorrigés juste après par _apply_project_categories() (étape 5bis de
+        full_sync_board), qui force label_type=PROJECT sur les noms lus depuis la carte
+        'Description' de la liste Product Backlog — indépendamment du type assigné ici.
+        """
         label_lower = label_name.lower()
 
         if "sprint" in label_lower:
@@ -494,8 +645,6 @@ class TrelloSyncService:
             sprint_num = int(match.group()) if match else None
             return LabelTypeEnum.SPRINT, sprint_num
 
-        if "project" in label_lower:
-            return LabelTypeEnum.PROJECT, None
         if "module" in label_lower:
             return LabelTypeEnum.MODULE, None
         if "status" in label_lower:
@@ -503,7 +652,7 @@ class TrelloSyncService:
         if "work" in label_lower or "type" in label_lower:
             return LabelTypeEnum.WORK_TYPE, None
 
-        return LabelTypeEnum.OTHER, None
+        return LabelTypeEnum.MODULE, None
 
     def _parse_datetime(self, datetime_str: Optional[str]) -> Optional[datetime]:
         """Parse une chaîne datetime ISO 8601 (Timezone-Aware)"""
@@ -521,3 +670,265 @@ class TrelloSyncService:
         if avatar_hash:
             return f"https://trello-avatars.s3.amazonaws.com/{avatar_hash}/170.jpg"
         return None
+
+    def _shift_early_morning_completion(self, moved_at: Optional[datetime]) -> Optional[datetime]:
+        """Si le passage vers un stage 'terminé' a lieu tôt le matin (avant
+        EARLY_MORNING_COMPLETION_CUTOFF_HOUR, en heure LOCALE de l'équipe), on considère que le
+        travail a en réalité été terminé la VEILLE — confirmé métier (cf. commentaire sur
+        EARLY_MORNING_COMPLETION_CUTOFF_HOUR). moved_at est stocké en UTC (cf. _parse_datetime) :
+        on convertit d'abord en heure locale pour juger de l'heure, mais on décale ensuite le
+        timestamp UTC d'ORIGINE de -1 jour (pas de conversion de fuseau qui resterait), pour ne
+        modifier QUE la date et garder l'heure telle quelle (duration_real_seconds reste donc
+        cohérent avec l'heure réelle du déplacement, seule sa date change).
+
+        Ne s'applique QU'aux passages de stage (DONE_STAGES) — PAS à last_pr_comment_at
+        (override PR juste après, cf. plus bas) : un commentaire de PR reflète un événement
+        automatique horodaté au moment réel du travail, sans risque d'oubli de la part du dev,
+        contrairement au déplacement manuel d'une carte sur Trello."""
+        if moved_at is None:
+            return moved_at
+        local_time = moved_at.astimezone(TEAM_TIMEZONE)
+        if local_time.hour < EARLY_MORNING_COMPLETION_CUTOFF_HOUR:
+            return moved_at - timedelta(days=1)
+        return moved_at
+
+    def _sync_card_dates(self, db, board_id: int) -> int:
+        """
+        Calcule started_at, completed_at, duration_working_days ET duration_real_seconds
+        pour chaque carte, à partir de card_history — en ne retenant QUE les actions
+        faites par un propriétaire actuel de la carte (card_members), en EXCLUANT
+        systématiquement la PO (PO_EXCLUDED_TRELLO_IDS), et en ignorant toute action
+        dont l'auteur n'est pas identifié (actor_trello_id NULL → prudence, on ignore).
+        """
+        START_STAGE = WorkflowStageEnum.IN_PROGRESS
+        DONE_STAGES = {
+            WorkflowStageEnum.WAITING_QA,
+            # "Done / À valider" (WAITING_VALIDATION) manquait ici : une carte qui atteint ce
+            # stage et n'en ressort jamais (ou seulement via des actions d'un ex-membre, cf.
+            # filtre relevant_history) n'était donc jamais considérée comme terminée, même si
+            # c'est bien son état final actuel sur Trello — confirmé métier.
+            WorkflowStageEnum.WAITING_VALIDATION,
+            WorkflowStageEnum.DONE_SPRINT,
+            WorkflowStageEnum.DONE_PREPROD,
+            WorkflowStageEnum.IN_PROD,
+        }
+        # Une carte renvoyée en Product/Sprint Backlog depuis "En cours" est déprogrammée : elle
+        # n'est plus du tout en cours de traitement — confirmé métier. Sans traitement dédié, elle
+        # gardait son started_at d'origine avec completed_at à None et apparaissait donc dans le
+        # rapport comme une carte "jamais terminée" alors qu'elle n'est en réalité pas (ou plus)
+        # du tout travaillée. Cf. plus bas : on réinitialise entièrement started_at/completed_at
+        # quand ce cas survient.
+        BACKLOG_STAGES = {
+            WorkflowStageEnum.PRODUCT_BACKLOG,
+            WorkflowStageEnum.SPRINT_BACKLOG,
+        }
+
+        cards = db.query(Card).filter(Card.board_id == board_id).all()
+
+        count = 0
+        for card in cards:
+            # IDs Trello des propriétaires ACTUELS de la carte
+            owner_trello_ids = {
+                                   m.trello_id for m in card.members
+                               } - PO_EXCLUDED_TRELLO_IDS
+
+            history = (
+                db.query(CardHistory)
+                .join(List, CardHistory.to_list_id == List.id)
+                .filter(CardHistory.card_id == card.id)
+                .order_by(CardHistory.moved_at.asc())
+                .all()
+            )
+
+            # Filtre : action faite par un propriétaire actuel, jamais par la PO
+            relevant_history = [
+                record for record in history
+                if record.actor_trello_id
+                   and record.actor_trello_id not in PO_EXCLUDED_TRELLO_IDS
+                   and record.actor_trello_id in owner_trello_ids
+            ]
+
+            started_at = None
+            completed_at = None
+            # Date BRUTE (avant décalage "avant 9h = veille") de l'événement qui a produit
+            # completed_at. Sert UNIQUEMENT à valider la cohérence chronologique
+            # (completed_at_raw >= started_at) : le décalage de _shift_early_morning_completion
+            # change la date d'ATTRIBUTION métier d'une completion, pas l'instant réel où
+            # l'événement a eu lieu. Sans cette distinction, une carte démarrée l'après-midi
+            # (ex: 18/06 12:18) puis terminée tôt le lendemain matin (ex: 19/06 8:31, décalée à
+            # 18/06 8:31 par la règle des 9h) se retrouvait avec un completed_at "avant" son
+            # started_at une fois décalé, alors que dans la réalité la completion (19/06 8:31)
+            # est bien postérieure au démarrage (18/06 12:18) — ce qui invalidait à tort la date
+            # de fin (mise à None) et faisait disparaître la carte des complétées.
+            completed_at_raw = None
+
+            # Vrai depuis le dernier started_at si un DONE_STAGES a été atteint sans qu'on soit
+            # repassé par "En cours" depuis — sert à distinguer, lors d'un retour en "En cours",
+            # un simple aller-retour Stand By/Rétro (pas de "terminé" entre les deux, cf. règle 1
+            # cas principal) d'un vrai rework après complétion (cf. règle 1 cas "sinon").
+            done_since_last_start = False
+            # Vrai dès qu'un premier rework après complétion a eu lieu (carte "terminée" puis
+            # repassée en "En cours") — confirmé métier (règle 1, cas "sinon") : une fois ce cas
+            # survenu, started_at ne doit plus JAMAIS être réécrit par un futur passage en
+            # "En cours" (ni par un nouveau rework, ni par un simple aller-retour Stand By/Rétro
+            # qui suivrait) — c'est la toute première date de démarrage réel qui compte.
+            reworked_after_done = False
+
+            for record in relevant_history:
+                stage = record.to_list.workflow_stage
+
+                if stage == START_STAGE:
+                    if started_at is None:
+                        # Tout premier passage en "En cours" de la carte.
+                        started_at = record.moved_at
+                    elif done_since_last_start:
+                        # La carte avait atteint un stage "terminé" (DONE_STAGES) puis revient en
+                        # "En cours" : c'est un rework, pas un simple aller-retour Stand By/Rétro
+                        # — confirmé métier (règle 1, cas "sinon"). On NE met PAS started_at à
+                        # jour : on garde la date du passage en "En cours" qui avait mené à ce
+                        # "terminé" (déjà stockée dans started_at). La complétion précédente est
+                        # invalidée : le travail a réellement repris, la carte n'est donc plus
+                        # "terminée" tant qu'elle n'aura pas de nouveau atteint un DONE_STAGES.
+                        completed_at = None
+                        completed_at_raw = None
+                        reworked_after_done = True
+                    elif not reworked_after_done:
+                        # Simple aller-retour via Stand By / Rétrospective, SANS passage par un
+                        # stage "terminé" entre les deux — confirmé métier (règle 1, cas
+                        # principal) : on prend la date de ce (dernier en date) passage en
+                        # "En cours", pas celle du premier, car le vrai travail effectif n'a
+                        # repris qu'à ce moment-là (ex: carte passée en cours le 28/05, renvoyée
+                        # en Stand By, puis repassée en cours le 03/06 → on démarre le calcul à
+                        # partir du 03/06, pas du 28/05).
+                        started_at = record.moved_at
+                    # Si reworked_after_done est déjà vrai, on ne touche plus jamais à
+                    # started_at, quel que soit le type de retour en "En cours" (cf. plus haut).
+                    done_since_last_start = False
+
+                if stage in DONE_STAGES:
+                    # On prend le DERNIER stage "terminé" (DONE_STAGES) atteint depuis le dernier
+                    # retour en "En cours", pas le premier — confirmé métier (règle 2) : un simple
+                    # passage en "A vérifier / QA" ne garantit pas que la carte est réellement
+                    # terminée, elle peut encore revenir en "En cours" pour du rework. On ne
+                    # fige donc la date de fin qu'au DERNIER stage "terminé" atteint avant un
+                    # éventuel retour en "En cours" (ex: QA le 5 puis Préprod le 8 → la carte est
+                    # considérée terminée le 8, pas le 5 ; si la carte reste en QA sans jamais
+                    # avancer ni revenir en "En cours", elle reste considérée terminée le 5).
+                    completed_at_raw = record.moved_at
+                    completed_at = self._shift_early_morning_completion(record.moved_at)
+                    done_since_last_start = True
+
+                if stage in BACKLOG_STAGES:
+                    # La carte est déprogrammée (renvoyée en Product/Sprint Backlog) : on
+                    # réinitialise tout comme si elle n'avait jamais démarré — confirmé métier.
+                    # Contrairement au retour en Stand By/Rétro (règle 1), qui garde une date de
+                    # démarrage car le travail reprendra "bientôt", un retour en backlog signifie
+                    # que la carte n'est plus du tout d'actualité pour l'instant : ni started_at
+                    # ni completed_at ne doivent rester renseignés. Si elle repasse un jour en
+                    # "En cours", elle repartira sur un cycle tout neuf (started_at = cette
+                    # nouvelle date, via la branche "started_at is None" ci-dessus) — y compris si
+                    # un rework après complétion avait eu lieu avant : le passage en backlog
+                    # efface aussi ce gel (reworked_after_done).
+                    started_at = None
+                    completed_at = None
+                    completed_at_raw = None
+                    done_since_last_start = False
+                    reworked_after_done = False
+
+            # Deux signaux PEUVENT indiquer la fin d'une carte : atteindre un stage "terminé"
+            # (à valider / done / fini ce sprint / terminé (preprod) / en prod / à vérifier-QA
+            # — cf. DONE_STAGES) OU avoir un PR créé. Le PR est PRIORITAIRE sur le stage Trello,
+            # peu importe lequel est le plus récent — confirmé métier (ex: PR posté le 2, carte
+            # déplacée en "Done / À valider" seulement le 10 → la carte est considérée terminée
+            # le 2, pas le 10 : le code était réellement prêt dès le PR, le déplacement Trello
+            # n'est qu'une formalité administrative qui traîne). Une carte peut avoir plusieurs
+            # PR (corrections successives) : last_pr_comment_at retient déjà le PLUS RÉCENT
+            # (cf. _sync_card_history). Le stage Trello ne sert de date de fin QUE s'il n'y a
+            # aucun PR du tout sur la carte.
+            if card.last_pr_comment_at:
+                completed_at = card.last_pr_comment_at
+                # Pas de décalage 9h sur un commentaire de PR (cf. docstring de
+                # _shift_early_morning_completion) : la date brute est la date elle-même.
+                completed_at_raw = card.last_pr_comment_at
+
+            # Carte qui saute directement du backlog (Product Backlog / Sprint Backlog) à un
+            # stage terminé, SANS jamais passer par IN_PROGRESS (donc started_at encore None à
+            # ce stade) : on la considère démarrée ET terminée le même jour que sa date de fin —
+            # confirmé métier. Sans ce cas, started_at restait None pour toujours et la carte
+            # disparaissait purement et simplement du rapport (aucune activité mesurable),
+            # alors qu'elle a bien été traitée, juste très vite / sans étape "En cours" tracée.
+            if started_at is None and completed_at is not None:
+                started_at = completed_at
+
+            # Validation de cohérence sur la date BRUTE (avant décalage 9h) — cf. commentaire sur
+            # completed_at_raw plus haut. On ne compare plus started_at au completed_at déjà
+            # décalé, pour ne pas invalider à tort des cartes terminées tôt le matin juste après
+            # un démarrage l'après-midi de la veille. Un completed_at_raw < started_at signifie
+            # que l'événement de fin lui-même (avant tout décalage métier) précède le démarrage :
+            # c'est une VRAIE incohérence de données (pas un simple effet du décalage 9h) → on
+            # invalide.
+            if started_at and completed_at_raw and completed_at_raw < started_at:
+                logger.warning("Ignoring invalid completion date for card %s", card.id)
+                completed_at = None
+                completed_at_raw = None
+            elif started_at and completed_at and completed_at < started_at:
+                # Le décalage "avant 9h = veille" a ramené completed_at à une date/heure
+                # antérieure à started_at (ex: carte démarrée à 12:18 puis passée en stage
+                # terminé le lendemain à 8:31, décalée à la veille 8:31 < 12:18 le même jour).
+                # L'événement réel (completed_at_raw) est bien postérieur à started_at — validé
+                # ci-dessus — donc ce n'est PAS une incohérence de données, juste un effet de
+                # bord du décalage métier. On clamp à started_at plutôt que d'invalider : la
+                # DATE reste la même (jour voulu par la règle des 9h), seule l'heure de stockage
+                # est ajustée, et la contrainte SQL chk_dates_order (completed_at >= started_at)
+                # est respectée.
+                completed_at = started_at
+
+            changed = False
+            if card.started_at != started_at:
+                card.started_at = started_at
+                changed = True
+            if card.completed_at != completed_at:
+                card.completed_at = completed_at
+                changed = True
+
+            # Durée "jours ouvrés" — conservée pour le Gantt existant
+            duration_days = self._working_days_between(started_at, completed_at)
+            if card.duration_working_days != duration_days:
+                card.duration_working_days = duration_days
+                changed = True
+
+            # NOUVEAU — durée réelle précise (secondes), pour affichage Xh Ymin.
+            # On utilise completed_at_raw (l'instant RÉEL de l'événement, avant décalage 9h et
+            # avant clamp) plutôt que completed_at : sinon la durée serait faussement nulle/
+            # négative pour une carte démarrée l'après-midi et terminée tôt le lendemain matin,
+            # alors qu'en vrai du temps de travail s'est écoulé entre les deux (cf. clamp
+            # ci-dessus). completed_at_raw a déjà été validé >= started_at plus haut.
+            duration_seconds = None
+            if started_at and completed_at_raw:
+                duration_seconds = int((completed_at_raw - started_at).total_seconds())
+            if card.duration_real_seconds != duration_seconds:
+                card.duration_real_seconds = duration_seconds
+                changed = True
+
+            if changed:
+                count += 1
+
+        db.commit()
+        return count
+
+    def _working_days_between(self, start, end) -> "int | None":
+        """Nombre de jours ouvrés (lun-ven) entre deux datetimes, bornes incluses. None si l'une manque."""
+        if not start or not end:
+            return None
+        if end < start:
+            logger.warning(f"⚠️  completed_at ({end}) antérieur à started_at ({start}) — duration mise à NULL")
+            return None
+
+        current = start.date()
+        end_date = end.date()
+        working_days = 0
+        while current <= end_date:
+            if current.weekday() < 5:  # 0=lundi ... 4=vendredi
+                working_days += 1
+            current += timedelta(days=1)
+        return working_days if working_days > 0 else None
