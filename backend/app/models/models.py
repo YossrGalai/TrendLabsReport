@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum as PyEnum
 from typing import List, Optional
 from sqlalchemy import (
@@ -353,7 +353,7 @@ class ReportRun(Base):
     sprint_numbers = Column(JSON, nullable=False, comment="Les 4 numéros de sprint composant ce rapport")
     status = Column(Enum(ReportStatusEnum, values_callable=lambda obj: [e.value for e in obj]), default=ReportStatusEnum.PENDING, nullable=False, index=True, comment="Generation state")
     file_path = Column(String(500), nullable=True, comment="Path to generated .xlsx file")
-    generated_at = Column(DateTime, nullable=True, comment="Generation completion timestamp")
+    generated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=True, comment="Generation completion timestamp")
     generated_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, comment="User who triggered generation")
     error_message = Column(Text, nullable=True, comment="Error message if status=error")
 

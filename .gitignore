@@ -1,9 +1,23 @@
-backend/__pycache__/
+# Python
+__pycache__/
+*.pyc
+
+# Environnements
+backend/.env
+frontend/.env
+
+# IDE
+.idea/
+
+# Logs
+*.log
+
+# Python storage
 backend/app/storage/
+
+# Generated reports
+backend/storage/reports/*.xlsx
+
+# Frontend
 frontend/node_modules/
 frontend/dist/
-backend/.env
-.idea/
-*.pyc
-*.log
-__pycache__

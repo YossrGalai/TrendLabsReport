@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import Dict, Any
 import logging
+from datetime import timezone
 
 from app.database.db import get_db
 from app.services.trello.trello_service import TrelloService
@@ -78,8 +79,11 @@ def check_sync_status(
             "board_id": board.id,
             "board_name": board.name,
             "trello_id": board.trello_id,
-            "last_sync_at": board.last_sync_at.isoformat() if board.last_sync_at else None,
-            "created_at": board.created_at.isoformat(),
+            "last_sync_at": (
+                board.last_sync_at.replace(tzinfo=timezone.utc).isoformat()
+                if board.last_sync_at else None
+            ),
+            "created_at": board.created_at.replace(tzinfo=timezone.utc).isoformat(),
             "counts": {
                 "lists": lists_count,
                 "members": members_count,
@@ -181,7 +185,10 @@ def list_boards(
                 "id": b.id,
                 "name": b.name,
                 "trello_id": b.trello_id,
-                "last_sync_at": b.last_sync_at.isoformat() if b.last_sync_at else None,
+                "last_sync_at": (
+                    b.last_sync_at.replace(tzinfo=timezone.utc).isoformat()
+                    if b.last_sync_at else None
+                ),
             }
             for b in boards
         ],

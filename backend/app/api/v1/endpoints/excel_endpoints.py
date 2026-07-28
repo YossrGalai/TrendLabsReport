@@ -5,7 +5,8 @@ import os
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field , field_serializer
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.database.db import get_db
@@ -46,6 +47,15 @@ class ReportRunOut(BaseModel):
     status: str
     file_path: str | None = None
     generated_at: datetime | None = None
+
+    @field_serializer("generated_at")
+    def _serialize_generated_at(self, value: datetime | None, _info):
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+
     error_message: str | None = None
 
     class Config:
@@ -290,7 +300,7 @@ def generate_report(trello_board_id: str, payload: ReportGenerateRequest, db: Se
             success=True,
             report_run_id=report_run.id,
             file_path=file_path,
-            timestamp=timestamp.isoformat(),
+            timestamp=timestamp.replace(tzinfo=timezone.utc).isoformat(),
         )
 
     except Exception as e:
@@ -304,7 +314,7 @@ def generate_report(trello_board_id: str, payload: ReportGenerateRequest, db: Se
             success=False,
             report_run_id=report_run.id,
             error=str(e),
-            timestamp=timestamp.isoformat(),
+            timestamp=timestamp.replace(tzinfo=timezone.utc).isoformat(),
         )
 
 
@@ -374,8 +384,5 @@ def download_report(report_run_id: int, db: Session = Depends(get_db)):
         path=file_path,
         filename=file_path.name,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        # Empêche le navigateur/Swagger UI de mettre en cache la réponse (et donc de réafficher
-        # une ancienne erreur 404/409/410 déjà vue pour ce même report_run_id, comme observé
-        # précédemment — le fichier peut changer d'état entre deux appels sur la même URL).
         headers={"Cache-Control": "no-store"},
     )

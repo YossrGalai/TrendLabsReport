@@ -1,6 +1,9 @@
 import logging
 import re
+import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -46,6 +49,13 @@ TEAM_TIMEZONE = ZoneInfo("Africa/Tunis")
 # travail en plus qui n'a en réalité pas eu lieu.
 EARLY_MORNING_COMPLETION_CUTOFF_HOUR = 9
 
+# Nombre de requêtes Trello (get_card_actions) lancées en parallèle lors du fetch de
+# l'historique des cartes modifiées. Ramené de 8 à 4 après des 429 (Too Many Requests) observés
+# en usage réel avec 8 workers — TrelloService gère désormais un retry avec backoff sur 429 (cf.
+# trello_service.py), mais mieux vaut limiter la casse en amont plutôt que de compter uniquement
+# sur les retries.
+HISTORY_FETCH_MAX_WORKERS = 4
+
 class TrelloSyncService:
     """Service de synchronisation bidirectionnelle Trello ↔ MySQL"""
 
@@ -56,48 +66,106 @@ class TrelloSyncService:
     # 1. SYNCHRONISATION PRINCIPALE
     # ========================================================================
 
+    @contextmanager
+    def _step_timer(self, step_durations: Dict[str, float], step_name: str):
+        """Chronomètre une étape du sync et enregistre sa durée (en secondes, arrondie au ms
+        près) dans step_durations[step_name]. Permet de savoir, sync après sync, quelle étape
+        redevient lente en premier — plutôt que de ne connaître que le temps total, qui ne dit
+        pas OÙ chercher quand un sync recommence à traîner."""
+        step_start = time.perf_counter()
+        try:
+            yield
+        finally:
+            step_durations[step_name] = round(time.perf_counter() - step_start, 3)
+
     def full_sync_board(self, db: Session, board_id: str) -> Dict[str, Any]:
         """Synchronisation COMPLÈTE d'un board"""
         sync_start = datetime.now(timezone.utc)
+        sync_start_perf = time.perf_counter()
+        step_durations: Dict[str, float] = {}
 
         try:
             # 1. Créer/récupérer le board
-            board = self._sync_board(db, board_id)
-            logger.info(f"✅ Board synced: {board.name} (ID={board.id})")
+            with self._step_timer(step_durations, "board"):
+                board = self._sync_board(db, board_id)
+            logger.info(
+                f"✅ Board synced: {board.name} (ID={board.id}) "
+                f"— {step_durations['board']}s"
+            )
 
             # 2. Synchroniser les listes
-            lists_count = self._sync_lists(db, board.id, board_id)
-            logger.info(f"✅ {lists_count} lists synced")
+            with self._step_timer(step_durations, "lists"):
+                lists_count = self._sync_lists(db, board.id, board_id)
+            logger.info(f"✅ {lists_count} lists synced — {step_durations['lists']}s")
 
             # 3. Synchroniser les membres
-            members_count = self._sync_members(db, board_id)
-            logger.info(f"✅ {members_count} members synced")
+            with self._step_timer(step_durations, "members"):
+                members_count = self._sync_members(db, board_id)
+            logger.info(f"✅ {members_count} members synced — {step_durations['members']}s")
 
             # 4. Synchroniser les labels
-            labels_count = self._sync_labels(db, board.id, board_id)
-            logger.info(f"✅ {labels_count} labels synced")
+            with self._step_timer(step_durations, "labels"):
+                labels_count = self._sync_labels(db, board.id, board_id)
+            logger.info(f"✅ {labels_count} labels synced — {step_durations['labels']}s")
 
             # 5. Synchroniser les cartes + relations
-            cards_count = self._sync_cards(db, board.id, board_id)
-            logger.info(f"✅ {cards_count} cards synced")
+            # Un seul appel API pour récupérer les cartes du board, réutilisé pour _sync_cards
+            # ET _sync_card_history ci-dessous (auparavant chacune refaisait son propre appel
+            # get_board_cards — un aller-retour réseau complet en double à chaque sync).
+            with self._step_timer(step_durations, "cards"):
+                trello_cards = self.trello.get_board_cards(board_id)
+                cards_count, previous_activity_by_trello_id = self._sync_cards(
+                    db, board.id, trello_cards
+                )
+            logger.info(f"✅ {cards_count} cards synced — {step_durations['cards']}s")
 
             # 5bis. Détecter les catégories-projet (carte 'Product Backlog')
             #       et reclassifier les labels correspondants
-            project_names = self._sync_project_categories(db, board.id)
-            categories_updated = self._apply_project_categories(db, board.id, project_names)
-            logger.info(f"✅ {categories_updated} labels reclassifiés en PROJECT")
+            with self._step_timer(step_durations, "project_categories"):
+                project_names = self._sync_project_categories(db, board.id)
+                categories_updated = self._apply_project_categories(db, board.id, project_names)
+            logger.info(
+                f"✅ {categories_updated} labels reclassifiés en PROJECT "
+                f"— {step_durations['project_categories']}s"
+            )
 
-            # 6. Synchroniser l'historique des cartes
-            history_count = self._sync_card_history(db, board_id)
-            logger.info(f"✅ {history_count} history records synced")
+            # 6. Synchroniser l'historique des cartes — SEULEMENT pour les cartes dont
+            #    dateLastActivity a changé depuis le dernier sync connu (previous_activity_by_
+            #    trello_id, capturé dans _sync_cards AVANT écrasement). C'est le principal poste
+            #    de lenteur du sync complet : un appel Trello par carte. Sur un sync où peu de
+            #    cartes ont bougé, ça réduit le nombre d'appels de "toutes les cartes" à
+            #    "seulement celles modifiées". C'est aussi l'étape à surveiller en priorité dans
+            #    step_durations["history"] : si elle redevient lente, c'est probablement le
+            #    filtrage incrémental qui ne saute plus grand-chose (beaucoup de cartes modifiées
+            #    d'un coup, ou previous_activity absent en masse après une remise à zéro).
+            with self._step_timer(step_durations, "history"):
+                history_count = self._sync_card_history(
+                    db, trello_cards, previous_activity_by_trello_id
+                )
+            logger.info(f"✅ {history_count} history records synced — {step_durations['history']}s")
+
+            # 6bis. Déduire un propriétaire pour les cartes sans membre Trello assigné,
+            #       à partir de l'historique (cf. _infer_owners_for_unassigned_cards)
+            with self._step_timer(step_durations, "inferred_owners"):
+                inferred_count = self._infer_owners_for_unassigned_cards(db, board.id)
+            logger.info(
+                f"✅ {inferred_count} cartes non assignées → propriétaire déduit "
+                f"— {step_durations['inferred_owners']}s"
+            )
 
             # 7. Calculer started_at / completed_at / duration_working_days
-            dates_count = self._sync_card_dates(db, board.id)
-            logger.info(f"✅ {dates_count} card dates computed")
+            with self._step_timer(step_durations, "card_dates"):
+                dates_count = self._sync_card_dates(db, board.id)
+            logger.info(f"✅ {dates_count} card dates computed — {step_durations['card_dates']}s")
 
             # Update last_sync_at (Timezone-aware)
             board.last_sync_at = datetime.now(timezone.utc)
             db.commit()
+
+            total_seconds = round(time.perf_counter() - sync_start_perf, 3)
+            logger.info(
+                f"⏱️  Sync terminé en {total_seconds}s — détail par étape : {step_durations}"
+            )
 
             return {
                 "success": True,
@@ -109,10 +177,12 @@ class TrelloSyncService:
                     "labels": labels_count,
                     "cards": cards_count,
                     "history": history_count,
+                    "inferred_owners": inferred_count,
                     "dates_computed": dates_count,
                     "project_categories_detected": len(project_names),
                 },
-                "sync_duration_seconds": (datetime.now(timezone.utc) - sync_start).total_seconds(),
+                "sync_duration_seconds": total_seconds,
+                "step_durations_seconds": step_durations,
                 "timestamp": sync_start.isoformat(),
             }
 
@@ -122,6 +192,7 @@ class TrelloSyncService:
             return {
                 "success": False,
                 "error": str(e),
+                "step_durations_seconds": step_durations,
                 "timestamp": sync_start.isoformat(),
             }
 
@@ -250,10 +321,20 @@ class TrelloSyncService:
         db.commit()
         return count
 
-    def _sync_cards(self, db: Session, board_id: int, trello_board_id: str) -> int:
-        """Synchronise les cartes + relations"""
-        trello_cards = self.trello.get_board_cards(trello_board_id)
+    def _sync_cards(
+        self, db: Session, board_id: int, trello_cards: list[dict]
+    ) -> Tuple[int, Dict[str, Optional[datetime]]]:
+        """Synchronise les cartes + relations à partir d'une liste déjà récupérée depuis Trello
+        (voir full_sync_board — évite un second appel réseau identique).
+
+        Retourne (nombre de cartes créées, dict {trello_card_id: ancienne date_last_activity}).
+        Ce second élément capture la valeur de date_last_activity AVANT qu'elle ne soit écrasée
+        par la valeur fraîche ci-dessous : c'est ce qui permet à _sync_card_history de détecter
+        quelles cartes ont réellement changé depuis le dernier sync (None = carte nouvelle,
+        jamais synchronisée → son historique doit être fetché en entier).
+        """
         count = 0
+        previous_activity_by_trello_id: Dict[str, Optional[datetime]] = {}
 
         for trello_card in trello_cards:
             trello_card_id = trello_card.get("id")
@@ -272,6 +353,7 @@ class TrelloSyncService:
                 continue
 
             if existing_card:
+                previous_activity_by_trello_id[trello_card_id] = existing_card.date_last_activity
                 existing_card.name = trello_card.get("name", "Unknown")
                 existing_card.description = trello_card.get("desc", "")
                 existing_card.due_date = self._parse_datetime(trello_card.get("due"))
@@ -283,6 +365,7 @@ class TrelloSyncService:
                 existing_card.list_id = card_list.id
                 existing_card.board_id = board_id
             else:
+                previous_activity_by_trello_id[trello_card_id] = None
                 new_card = Card(
                     trello_id=trello_card_id,
                     board_id=board_id,
@@ -311,7 +394,7 @@ class TrelloSyncService:
                 )
 
         db.commit()
-        return count
+        return count, previous_activity_by_trello_id
 
     def _sync_card_members(self, db: Session, card_id: int, trello_member_ids: list[str]) -> None:
         """Synchronise les membres assignés à une carte"""
@@ -338,7 +421,9 @@ class TrelloSyncService:
             )
             db.add(new_card_member)
 
-        db.commit()
+        # Pas de commit ici : appelée depuis _sync_cards() dans une boucle par carte, un commit
+        # par carte multiplierait inutilement les allers-retours DB. Le commit unique de
+        # _sync_cards() à la fin de sa boucle couvre déjà ces changements.
 
     def _sync_card_labels(self, db: Session, card_id: int, trello_label_ids: list[str]) -> None:
         """Synchronise les labels assignés à une carte"""
@@ -365,21 +450,151 @@ class TrelloSyncService:
             )
             db.add(new_card_label)
 
-        db.commit()
+        # Pas de commit ici, même raison que _sync_card_members ci-dessus.
 
-    def _sync_card_history(self, db: Session, trello_board_id: str) -> int:
-        """Synchronise l'historique des cartes"""
-        cards = db.query(Card).filter(Card.trello_id.in_(
-            [c.get("id") for c in self.trello.get_board_cards(trello_board_id)]
-        )).all()
+    def _fetch_card_actions_parallel(
+        self, trello_card_ids: list[str]
+    ) -> Dict[str, list]:
+        """Récupère les actions Trello (get_card_actions) de plusieurs cartes EN PARALLÈLE.
+
+        Ces appels sont indépendants les uns des autres (une carte = un appel HTTP), donc le
+        temps total était auparavant la somme de toutes les latences réseau — avec
+        HISTORY_FETCH_MAX_WORKERS workers, il se rapproche plutôt de (nombre de cartes /
+        max_workers) x latence moyenne. On reste à 8 workers par prudence vis-à-vis du rate
+        limit Trello (cf. commentaire sur HISTORY_FETCH_MAX_WORKERS) — si TrelloService partage
+        une session HTTP unique non thread-safe entre les appels, il faudra adapter TrelloService
+        pour créer une session par thread (ou utiliser un client HTTP thread-safe) avant
+        d'augmenter ce nombre.
+
+        Une carte dont l'appel échoue est absente du dict retourné (voir le log d'erreur) plutôt
+        que de faire échouer tout le sync — comportement équivalent au try/except par carte
+        qu'il y avait avant dans la boucle séquentielle.
+        """
+        actions_by_trello_id: Dict[str, list] = {}
+
+        with ThreadPoolExecutor(max_workers=HISTORY_FETCH_MAX_WORKERS) as executor:
+            future_to_card_id = {
+                executor.submit(
+                    self.trello.get_card_actions,
+                    trello_card_id,
+                    action_types="createCard,copyCard,updateCard,commentCard",
+                ): trello_card_id
+                for trello_card_id in trello_card_ids
+            }
+
+            for future in as_completed(future_to_card_id):
+                trello_card_id = future_to_card_id[future]
+                try:
+                    actions_by_trello_id[trello_card_id] = future.result()
+                except Exception as e:
+                    logger.error(
+                        f"❌ Error fetching actions for card {trello_card_id}: {e}"
+                    )
+
+        return actions_by_trello_id
+
+    def _to_aware_utc(self, dt: Optional[datetime]) -> Optional[datetime]:
+        """Normalise un datetime éventuellement naive en UTC aware.
+
+        MySQL (colonne DATETIME) ne conserve pas le fuseau horaire : une valeur écrite en UTC
+        aware (via _parse_datetime) revient NAIVE une fois relue depuis la DB, alors que
+        _parse_datetime() sur une réponse Trello fraîche produit toujours un datetime AWARE
+        (+00:00). Comparer directement les deux lève TypeError ("can't compare offset-naive and
+        offset-aware datetimes") — d'où ce helper, à utiliser sur toute valeur qui a pu transiter
+        par la DB avant d'être comparée à une valeur fraîchement parsée depuis Trello. Sûr ici
+        car toutes les datetimes de ce service sont stockées en UTC (cf. _parse_datetime)."""
+        if dt is None or dt.tzinfo is not None:
+            return dt
+        return dt.replace(tzinfo=timezone.utc)
+
+    def _floor_to_second(self, dt: Optional[datetime]) -> Optional[datetime]:
+        """Tronque un datetime à la seconde (microseconde=0).
+
+        Purement une histoire de comparaison Python — ne touche pas la colonne DATETIME en base.
+        Correspond exactement à la précision réellement stockée par une colonne MySQL DATETIME
+        (qui garde les secondes, seules les millisecondes sont perdues à l'écriture) : ex.
+        14:23:11.734 devient 14:23:11, ce qui correspond à ce que MySQL a de toute façon stocké.
+        À utiliser pour toute comparaison entre une valeur relue depuis MySQL et une valeur
+        fraîchement parsée depuis Trello (qui, elle, garde toujours ses millisecondes) — sans ce
+        floor, une carte strictement inchangée ressort "différente" à chaque comparaison."""
+        if dt is None:
+            return None
+        return dt.replace(microsecond=0)
+
+    def _sync_card_history(
+        self,
+        db: Session,
+        trello_cards: list[dict],
+        previous_activity_by_trello_id: Dict[str, Optional[datetime]],
+    ) -> int:
+        """Synchronise l'historique des cartes — en ne rappelant Trello QUE pour les cartes
+        dont dateLastActivity a changé depuis le dernier sync connu.
+
+        Avant : un appel get_card_actions par carte du board, à CHAQUE sync, même si rien n'avait
+        bougé — c'était le principal poste de lenteur du sync complet (un aller-retour réseau par
+        carte, en série). Désormais : on compare le dateLastActivity renvoyé par Trello à
+        l'ancienne valeur stockée avant ce sync (previous_activity_by_trello_id, capturé dans
+        _sync_cards juste avant écrasement) — une carte identique n'a aucune raison d'avoir de
+        nouvelles actions, on saute donc son appel réseau. Les cartes qui ont bougé (ou qui sont
+        nouvelles → previous_activity absent/None, donc jamais fetchées) sont ensuite récupérées
+        en parallèle via _fetch_card_actions_parallel plutôt qu'en séquentiel.
+        """
+        trello_card_ids = [c.get("id") for c in trello_cards]
+        cards = db.query(Card).filter(Card.trello_id.in_(trello_card_ids)).all()
+        cards_by_trello_id = {card.trello_id: card for card in cards}
+
+        cards_to_fetch: list[Card] = []
+        for trello_card in trello_cards:
+            trello_card_id = trello_card.get("id")
+            card = cards_by_trello_id.get(trello_card_id)
+            if not card:
+                continue
+
+            trello_last_activity = self._parse_datetime(trello_card.get("dateLastActivity"))
+            previous_activity = self._to_aware_utc(
+                previous_activity_by_trello_id.get(trello_card_id)
+            )
+
+            # Comparaison à la SECONDE près (cf. _floor_to_second) : une colonne MySQL DATETIME
+            # classique tronque silencieusement les millisecondes à l'écriture, alors que Trello
+            # renvoie toujours dateLastActivity avec des millisecondes. Sans ce floor, une carte
+            # totalement inchangée ressortait quand même "modifiée" à chaque sync, ce qui annulait
+            # une bonne partie du gain du filtrage incrémental.
+            trello_last_activity_floored = self._floor_to_second(trello_last_activity)
+            previous_activity_floored = self._floor_to_second(previous_activity)
+
+            if (
+                previous_activity_floored is not None
+                and trello_last_activity_floored is not None
+                and trello_last_activity_floored <= previous_activity_floored
+            ):
+                # Rien de nouveau côté Trello sur cette carte depuis le dernier sync : on ne
+                # refait pas l'appel get_card_actions pour elle.
+                continue
+
+            cards_to_fetch.append(card)
+
+        if not cards_to_fetch:
+            logger.info("✅ Aucune carte modifiée depuis le dernier sync — historique inchangé")
+            return 0
+
+        logger.info(
+            f"  ↪️  {len(cards_to_fetch)}/{len(cards)} carte(s) modifiée(s) depuis le dernier "
+            f"sync → fetch de leur historique (les autres sont sautées)"
+        )
+
+        actions_by_trello_id = self._fetch_card_actions_parallel(
+            [card.trello_id for card in cards_to_fetch]
+        )
 
         count = 0
-        for card in cards:
+        for card in cards_to_fetch:
             try:
-                trello_actions = self.trello.get_card_actions(
-                    card.trello_id,
-                    action_types="createCard,copyCard,updateCard,commentCard",
-                )
+                trello_actions = actions_by_trello_id.get(card.trello_id)
+                if trello_actions is None:
+                    # Le fetch parallèle a échoué pour cette carte (déjà loggé) : on la saute,
+                    # elle sera retentée au prochain sync.
+                    continue
 
                 # Le dernier commentaire "PR #xxx created by ..." trouvé sur cette carte, tous
                 # membres confondus (contrairement aux déplacements de liste, on ne filtre PAS
@@ -692,6 +907,86 @@ class TrelloSyncService:
             return moved_at - timedelta(days=1)
         return moved_at
 
+    def _infer_owners_for_unassigned_cards(self, db: Session, board_id: int) -> int:
+        """Déduit un propriétaire pour les cartes SANS membre Trello (idMembers vide) mais
+        clairement travaillées par un agent — cas confirmé métier : une carte est déplacée en
+        "En cours" par un dev, un PR est créé, la carte avance jusqu'à Terminé, sans que
+        personne ne se soit jamais ajouté comme membre Trello dessus. Une telle carte ne doit
+        pas rester "non assigné" côté reporting.
+
+        Source du signal : l'ACTEUR (memberCreator Trello) du dernier passage de la carte vers
+        le stage "En cours" (IN_PROGRESS), retrouvé dans card_history — PAS le texte des
+        commentaires "PR #xxx created by ..." : ce commentaire est souvent posté par un webhook
+        Bitbucket sous le compte d'une autre personne (ex: le chef de projet), donc son
+        memberCreator ne reflète pas forcément le vrai auteur du PR, alors que l'acteur du
+        déplacement de liste, lui, est toujours la bonne personne.
+
+        Ne touche JAMAIS aux cartes ayant déjà au moins un membre Trello réel : l'assignation
+        explicite reste toujours prioritaire et n'est pas remplacée.
+
+        Recalculée entièrement à CHAQUE sync (purge puis ré-inférence) : comme _sync_card_members
+        (étape 5) retire déjà tout membre absent des idMembers Trello actuels, un membre déduit
+        lors d'un sync précédent est automatiquement supprimé au sync suivant si la carte est
+        toujours sans membre Trello — cette méthode le ré-ajoute donc à chaque fois plutôt que de
+        se reposer sur un état persistant.
+        """
+        count = 0
+
+        unassigned_card_ids = {
+            card_id for (card_id,) in db.query(Card.id).filter(
+                Card.board_id == board_id,
+                ~Card.id.in_(db.query(CardMember.card_id))
+            ).all()
+        }
+
+        if not unassigned_card_ids:
+            return count
+
+        for card_id in unassigned_card_ids:
+            # Tous les passages vers "En cours" de la carte, du plus récent au plus ancien —
+            # on ignore le chef de projet (PO_EXCLUDED_TRELLO_IDS) car un déplacement de sa
+            # part ne signifie pas qu'il a travaillé la carte, et on retombe alors sur le
+            # passage "En cours" précédent s'il y en a un.
+            entries_in_progress = (
+                db.query(CardHistory)
+                .join(List, CardHistory.to_list_id == List.id)
+                .filter(
+                    CardHistory.card_id == card_id,
+                    List.workflow_stage == WorkflowStageEnum.IN_PROGRESS,
+                )
+                .order_by(CardHistory.moved_at.desc())
+                .all()
+            )
+
+            actor_trello_id = next(
+                (
+                    entry.actor_trello_id for entry in entries_in_progress
+                    if entry.actor_trello_id
+                    and entry.actor_trello_id not in PO_EXCLUDED_TRELLO_IDS
+                ),
+                None,
+            )
+
+            if not actor_trello_id:
+                continue
+
+            member = db.query(Member).filter(
+                Member.trello_id == actor_trello_id
+            ).first()
+
+            if not member:
+                continue
+
+            db.add(CardMember(card_id=card_id, member_id=member.id))
+            count += 1
+            logger.info(
+                f"  ↪️  Card #{card_id} sans membre Trello → assignée à "
+                f"{member.full_name} (déduit du passage en 'En cours')"
+            )
+
+        db.commit()
+        return count
+
     def _sync_card_dates(self, db, board_id: int) -> int:
         """
         Calcule started_at, completed_at, duration_working_days ET duration_real_seconds
@@ -776,11 +1071,18 @@ class TrelloSyncService:
 
             for record in relevant_history:
                 stage = record.to_list.workflow_stage
+                # Normalisation obligatoire ici : un CardHistory tout juste inséré PENDANT ce
+                # même sync (par _sync_card_history, encore dans la session SQLAlchemy) garde sa
+                # valeur Python aware d'origine, alors qu'un CardHistory déjà existant en base
+                # revient NAIVE une fois relu par la requête ci-dessus (cf. _to_aware_utc) — les
+                # deux peuvent se retrouver mélangés dans le même relevant_history, d'où le crash
+                # "can't compare offset-naive and offset-aware datetimes" sans cette normalisation.
+                moved_at = self._to_aware_utc(record.moved_at)
 
                 if stage == START_STAGE:
                     if started_at is None:
                         # Tout premier passage en "En cours" de la carte.
-                        started_at = record.moved_at
+                        started_at = moved_at
                     elif done_since_last_start:
                         # La carte avait atteint un stage "terminé" (DONE_STAGES) puis revient en
                         # "En cours" : c'est un rework, pas un simple aller-retour Stand By/Rétro
@@ -800,7 +1102,7 @@ class TrelloSyncService:
                         # repris qu'à ce moment-là (ex: carte passée en cours le 28/05, renvoyée
                         # en Stand By, puis repassée en cours le 03/06 → on démarre le calcul à
                         # partir du 03/06, pas du 28/05).
-                        started_at = record.moved_at
+                        started_at = moved_at
                     # Si reworked_after_done est déjà vrai, on ne touche plus jamais à
                     # started_at, quel que soit le type de retour en "En cours" (cf. plus haut).
                     done_since_last_start = False
@@ -814,8 +1116,8 @@ class TrelloSyncService:
                     # éventuel retour en "En cours" (ex: QA le 5 puis Préprod le 8 → la carte est
                     # considérée terminée le 8, pas le 5 ; si la carte reste en QA sans jamais
                     # avancer ni revenir en "En cours", elle reste considérée terminée le 5).
-                    completed_at_raw = record.moved_at
-                    completed_at = self._shift_early_morning_completion(record.moved_at)
+                    completed_at_raw = moved_at
+                    completed_at = self._shift_early_morning_completion(moved_at)
                     done_since_last_start = True
 
                 if stage in BACKLOG_STAGES:
@@ -846,10 +1148,10 @@ class TrelloSyncService:
             # (cf. _sync_card_history). Le stage Trello ne sert de date de fin QUE s'il n'y a
             # aucun PR du tout sur la carte.
             if card.last_pr_comment_at:
-                completed_at = card.last_pr_comment_at
+                completed_at = self._to_aware_utc(card.last_pr_comment_at)
                 # Pas de décalage 9h sur un commentaire de PR (cf. docstring de
                 # _shift_early_morning_completion) : la date brute est la date elle-même.
-                completed_at_raw = card.last_pr_comment_at
+                completed_at_raw = completed_at
 
             # Carte qui saute directement du backlog (Product Backlog / Sprint Backlog) à un
             # stage terminé, SANS jamais passer par IN_PROGRESS (donc started_at encore None à
@@ -883,11 +1185,18 @@ class TrelloSyncService:
                 # est respectée.
                 completed_at = started_at
 
+            # card.started_at / card.completed_at reviennent NAIVE (relus depuis la DB juste
+            # au-dessus, cf. requête `cards = db.query(Card)...`) tandis que started_at /
+            # completed_at sont désormais toujours AWARE (normalisés plus haut) — d'où
+            # _to_aware_utc pour ne pas lever TypeError. On floor aussi à la seconde (cf.
+            # _floor_to_second) : la colonne DATETIME peut avoir tronqué la sous-seconde au
+            # stockage précédent, sans quoi CHAQUE carte serait réécrite à chaque sync même sans
+            # changement réel.
             changed = False
-            if card.started_at != started_at:
+            if self._floor_to_second(self._to_aware_utc(card.started_at)) != self._floor_to_second(started_at):
                 card.started_at = started_at
                 changed = True
-            if card.completed_at != completed_at:
+            if self._floor_to_second(self._to_aware_utc(card.completed_at)) != self._floor_to_second(completed_at):
                 card.completed_at = completed_at
                 changed = True
 
