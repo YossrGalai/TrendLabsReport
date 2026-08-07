@@ -348,3 +348,37 @@ CREATE TABLE report_snapshots (
   INDEX idx_report_run_id (report_run_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='JSON snapshots of Trello data for report regeneration';
+
+
+
+/**
+ * TABLE: annual_report_runs
+ * Role: Historique de génération des rapports annuels
+ * Contrairement à report_runs (1 board + 1 projet + 1 mois), un rapport annuel couvre
+ * une plage de dates libre sur tous les boards (ou un sous-ensemble optionnel), tous
+ * projets confondus, avec un filtre sprint optionnel additionnel réglable par l'admin.
+ */
+CREATE TABLE annual_report_runs (
+  id INT AUTO_INCREMENT PRIMARY KEY COMMENT 'Internal ID',
+  date_start DATE NOT NULL COMMENT 'Début de la période demandée',
+  date_end DATE NOT NULL COMMENT 'Fin de la période demandée',
+  board_ids JSON NULL COMMENT 'Liste de boards.id inclus (NULL = tous les boards synchronisés)',
+  -- Traçabilité : contrairement à date_start/date_end (bornes), la liste de sprints
+  -- proposée par défaut (cf. AnnualReportService.list_sprints_in_period) peut être modifiée
+  -- par l'admin avant génération — on stocke la sélection FINALE utilisée, pas seulement
+  -- les bornes de dates, pour pouvoir reproduire ce run à l'identique plus tard.
+  sprint_numbers JSON NULL COMMENT 'Sprints effectivement inclus (NULL = filtre par dates uniquement, aucune restriction sprint)',
+  status ENUM('pending', 'running', 'done', 'error') NOT NULL DEFAULT 'pending' COMMENT 'Generation state',
+  file_path VARCHAR(500) NULL COMMENT 'Path to generated .xlsx file',
+  generated_at DATETIME NULL COMMENT 'Generation completion timestamp',
+  generated_by INT NULL COMMENT 'User who triggered generation (NULL if automatic)',
+  error_message TEXT NULL COMMENT 'Error message if status=error',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'Row creation date',
+
+  FOREIGN KEY (generated_by) REFERENCES users(id) ON DELETE SET NULL,
+  INDEX idx_date_range (date_start, date_end),
+  INDEX idx_status (status),
+
+  CONSTRAINT chk_annual_date_order CHECK (date_end >= date_start)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Historique de génération des rapports annuels (multi-board, multi-projet, filtre sprint optionnel)';

@@ -14,6 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1.endpoints.sync_endpoints import router as sync_router
 from app.api.v1.endpoints.trello_endpoints import router as trello_router
 from app.api.v1.endpoints.excel_endpoints import router as excel_router,boards_router
+from app.api.v1.endpoints.annual_report_endpoints import router as annual_report_router
+from app.api.v1.endpoints.sprint_discovery_endpoints import router as sprint_discovery_router
 
 app = FastAPI(
     title="TrendLabs Reporting Tool",
@@ -33,6 +35,8 @@ app.add_middleware(
 app.include_router(sync_router)
 app.include_router(trello_router)
 app.include_router(excel_router)
+app.include_router(annual_report_router)
+app.include_router(sprint_discovery_router)
 
 app.include_router(boards_router)
 

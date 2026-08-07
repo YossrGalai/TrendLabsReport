@@ -13,6 +13,19 @@ export async function fetchProjects(trelloBoardId) {
   return res.json();
 }
 
+// Sprints trouvés pour ce board+projet sur le mois choisi — alimente la pré-sélection de
+// SprintNumbersInput dans le formulaire mensuel (même concept que le rapport annuel).
+export async function fetchSprintsInMonth(trelloBoardId, projectLabelId, month, year) {
+  const url = new URL(`${BASE_URL}/api/boards/${trelloBoardId}/sprints`);
+  url.searchParams.set("project_label_id", String(projectLabelId));
+  url.searchParams.set("month", String(month));
+  url.searchParams.set("year", String(year));
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("Impossible de charger les sprints du mois");
+  const data = await res.json();
+  return data.sprint_numbers;
+}
+
 export async function generateReport(trelloBoardId, payload) {
   const res = await fetch(`${BASE_URL}/api/reports/generate/${trelloBoardId}`, {
     method: "POST",

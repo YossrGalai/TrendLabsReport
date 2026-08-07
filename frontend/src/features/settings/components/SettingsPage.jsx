@@ -11,7 +11,7 @@ const rules = [
     icon: Timer,
     title: "Début d'un ticket",
     description:
-      "Premier passage en liste « En cours » (stage IN_PROGRESS). Un simple aller-retour via Stand By/Rétrospective sans jamais atteindre un stage « terminé » repousse le début au dernier retour en cours — le vrai travail n'a repris qu'à ce moment-là.",
+      "Premier passage en liste « En cours » (stage IN_PROGRESS). Un simple aller-retour via Stand By/Rétrospective sans jamais atteindre un stage « terminé » repousse le début au dernier retour en cours — le vrai travail n'a repris qu'à ce moment-là. Les jours de weekend ne sont pas comptés dans le calcul de la durée et s'affichent donc à 0.",
   },
   {
     icon: GitPullRequest,

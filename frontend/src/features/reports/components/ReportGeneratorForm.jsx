@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, Loader2, Download, RefreshCw } from "lucide-react";
-import { useBoards, useProjects, useGenerateReport, useSyncBoard } from "../../../hooks/useReports";
+import { useBoards, useProjects, useSprintsInMonth, useGenerateReport, useSyncBoard } from "../../../hooks/useReports";
 import { downloadReport } from "../../../api/reports";
 import { SprintNumbersInput } from "./SprintNumbersInput";
 import { SyncNewBoardPanel } from "./SyncNewBoardPanel";
@@ -40,6 +40,21 @@ export function ReportGeneratorForm() {
   );
   const generateMutation = useGenerateReport(trelloBoardId);
   const syncMutation = useSyncBoard();
+  const { data: suggestedSprints, isLoading: loadingSprints } = useSprintsInMonth(
+    trelloBoardId || null, projectLabelId, month, year
+  );
+
+  // Pré-remplit dès que la suggestion arrive (ou change suite à un changement de board/
+  // projet/mois/année) — l'admin garde la main pour ajouter/retirer via SprintNumbersInput,
+  // exactement comme avant, seul le point de départ change. Si plus de 6 sprints sont
+  // trouvés (max physique du template Gantt), on NE pré-sélectionne rien automatiquement —
+  // choisir 6 sprints parmi N pour l'admin serait arbitraire ; il les ajoute lui-même via
+  // les suggestions cliquables affichées dans ce cas (cf. JSX plus bas).
+  useEffect(() => {
+    if (suggestedSprints && suggestedSprints.length <= 6) {
+      setSprintNumbers(suggestedSprints);
+    }
+  }, [suggestedSprints]);
 
   const selectedBoard = boards?.find((b) => b.trello_id === trelloBoardId);
 
@@ -131,6 +146,7 @@ export function ReportGeneratorForm() {
               onChange={(e) => {
                 setTrelloBoardId(e.target.value);
                 setProjectLabelId(null);
+                setSprintNumbers([]);
                 setStatus("idle");
                 setSyncMsg(null);
               }}
@@ -171,6 +187,7 @@ export function ReportGeneratorForm() {
               onSynced={(trelloId) => {
                 setTrelloBoardId(trelloId);
                 setProjectLabelId(null);
+                setSprintNumbers([]);
                 setStatus("idle");
               }}
             />
@@ -182,7 +199,7 @@ export function ReportGeneratorForm() {
           <select
             className={inputClass}
             value={projectLabelId ?? ""}
-            onChange={(e) => setProjectLabelId(e.target.value ? Number(e.target.value) : null)}
+            onChange={(e) => { setProjectLabelId(e.target.value ? Number(e.target.value) : null); setSprintNumbers([]); }}
             disabled={!trelloBoardId || loadingProjects}
           >
             <option value="">Sélectionner un projet</option>
@@ -207,7 +224,48 @@ export function ReportGeneratorForm() {
           </div>
         </div>
 
-        <SprintNumbersInput value={sprintNumbers} onChange={setSprintNumbers} />
+        <div>
+          <SprintNumbersInput value={sprintNumbers} onChange={setSprintNumbers} />
+          {trelloBoardId && projectLabelId !== null && (
+            loadingSprints ? (
+              <p className="text-xs text-muted-foreground mt-1.5">Détection des sprints du mois…</p>
+            ) : suggestedSprints && suggestedSprints.length > 6 ? (
+              <div className="mt-2">
+                <p className="text-xs text-warning mb-1.5">
+                  {suggestedSprints.length} sprints trouvés pour ce mois — choisissez-en 6 maximum (limite du template) :
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {suggestedSprints.map((n) => {
+                    const checked = sprintNumbers.includes(n);
+                    const atLimit = sprintNumbers.length >= 6;
+                    return (
+                      <button
+                        key={n}
+                        type="button"
+                        disabled={!checked && atLimit}
+                        onClick={() =>
+                          setSprintNumbers((prev) =>
+                            checked ? prev.filter((s) => s !== n) : [...prev, n].sort((a, b) => a - b)
+                          )
+                        }
+                        className={
+                          "rounded-full font-mono text-xs px-2.5 py-1 transition-colors " +
+                          (checked
+                            ? "bg-foreground text-background"
+                            : "bg-muted text-muted-foreground hover:bg-muted/70 disabled:opacity-40 disabled:cursor-not-allowed")
+                        }
+                      >
+                        Sprint {n}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : suggestedSprints && suggestedSprints.length === 0 ? (
+              <p className="text-xs text-muted-foreground mt-1.5">Aucun sprint trouvé pour ce mois — ajoutez-les manuellement.</p>
+            ) : null
+          )}
+        </div>
 
         <div>
           <label className={labelClass}>Chef de projet <span className="normal-case font-normal text-muted-foreground/70">(optionnel)</span></label>

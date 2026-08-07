@@ -1,8 +1,9 @@
 import { NavLink, useLocation } from "react-router-dom";
-import { FileSpreadsheet, LayoutGrid, History, Settings, Layers, HelpCircle } from "lucide-react";
+import { FileSpreadsheet, CalendarRange, LayoutGrid, History, Settings, Layers, HelpCircle } from "lucide-react";
 
 const nav = [
-  { label: "Générer un rapport", icon: FileSpreadsheet, to: "/" },
+  { label: "Rapport mensuel", icon: FileSpreadsheet, to: "/" },
+  { label: "Rapport annuel", icon: CalendarRange, to: "/rapport-annuel" },
   { label: "Boards synchronisés", icon: Layers, to: "/boards" },
   { label: "Historique", icon: History, to: "/historique" },
   { label: "Tableau de bord", icon: LayoutGrid, to: "/dashboard" },
@@ -11,15 +12,16 @@ const nav = [
 
 const breadcrumbByPath = {
   "/": ["Rapports", "Rapport mensuel"],
+  "/rapport-annuel": ["Rapports", "Rapport annuel"],
   "/boards": ["Rapports", "Boards synchronisés"],
   "/historique": ["Rapports", "Historique"],
   "/dashboard": ["Rapports", "Tableau de bord"],
   "/parametres": ["Rapports", "Règles de génération"],
 };
 
-// La page "Générer un rapport" (formulaire) est un peu plus large que les autres pages,
+// Les pages "formulaire" (mensuel ET annuel) sont un peu plus larges que les autres pages,
 // qui restent sur max-w-5xl pour rester lisibles (tableaux, listes...).
-const WIDE_ROUTES = new Set(["/"]);
+const WIDE_ROUTES = new Set(["/", "/rapport-annuel"]);
 
 export function AppShell({ children }) {
   const { pathname } = useLocation();
@@ -65,7 +67,7 @@ export function AppShell({ children }) {
           <HelpCircle className="size-4 text-sidebar-foreground/70" />
           <p className="mt-2 text-sm font-semibold">Besoin d'aide ?</p>
           <p className="mt-1 text-xs text-sidebar-foreground/60">
-            Consultez les règles de génération des rapports mensuels.
+            Consultez les règles de génération des rapports.
           </p>
         </NavLink>
       </aside>

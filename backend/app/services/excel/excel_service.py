@@ -1766,3 +1766,30 @@ class ExcelReportService:
 
     def _slugify(self, text: str) -> str:
         return "".join(c if c.isalnum() else "_" for c in text).strip("_")
+
+    def _effective_end_date(self, card: Card, period_end: date) -> Optional[date]:
+        """Comme completed_at, mais pour une carte encore ouverte : on la considère active
+        jusqu'à la borne de fin de la période demandée (ou aujourd'hui si plus tôt, pour ne
+        pas compter des jours futurs sur une carte toujours en cours)."""
+        if card.completed_at:
+            return card.completed_at.date()
+        if not card.started_at:
+            return None
+        return min(period_end, date.today())
+
+    def _card_active_days_in_annual(self, card: Card, day_filter: set, period_end: date) -> set:
+        """Équivalent de excel_service._card_active_days_in, mais tolère completed_at=None
+        en s'appuyant sur _effective_end_date."""
+        if not card.started_at:
+            return set()
+        start = card.started_at.date()
+        end = self._effective_end_date(card, period_end)
+        if end is None or end < start:
+            start, end = min(start, end or start), max(start, end or start)
+        days = set()
+        current = start
+        while current <= end:
+            if current in day_filter:
+                days.add(current)
+            current += timedelta(days=1)
+        return days

@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from enum import Enum as PyEnum
 from typing import List, Optional
 from sqlalchemy import (
-    Column, Integer, String, Text, DateTime, Boolean, Float,
+    Column, Integer, String, Text, DateTime, Date, Boolean, Float,
     ForeignKey, UniqueConstraint, Index, CheckConstraint,
     Enum, JSON
 )
@@ -383,6 +383,47 @@ class ReportRun(Base):
             f"<ReportRun(id={self.id}, board_id={self.board_id}, "
             f"project_label_id={self.project_label_id}, "
             f"month={self.report_month}/{self.report_year}, status={self.status})>"
+        )
+
+
+class AnnualReportRun(Base):
+    """Historique de génération des rapports annuels — contrairement à ReportRun (1 board +
+    1 projet + 1 mois via sprint_numbers obligatoires), un rapport annuel couvre une plage
+    de dates libre sur tous les boards (ou un sous-ensemble optionnel), tous projets
+    confondus, avec un filtre sprint FACULTATIF additionnel réglable par l'admin — d'où
+    board_ids/sprint_numbers en JSON nullable plutôt que des FK ou une liste obligatoire."""
+    __tablename__ = "annual_report_runs"
+
+    id = Column(Integer, primary_key=True, index=True, comment="Internal ID")
+    date_start = Column(Date, nullable=False, comment="Début de la période demandée")
+    date_end = Column(Date, nullable=False, comment="Fin de la période demandée")
+    board_ids = Column(JSON, nullable=True, comment="Liste de boards.id inclus (NULL = tous les boards synchronisés)")
+    # Sélection FINALE utilisée (après modification éventuelle par l'admin depuis la liste
+    # par défaut proposée par AnnualReportService.list_sprints_in_period) — stockée pour
+    # pouvoir reproduire ce run à l'identique plus tard. NULL = aucune restriction sprint,
+    # filtre par dates uniquement.
+    sprint_numbers = Column(JSON, nullable=True, comment="Sprints effectivement inclus (NULL = filtre par dates uniquement)")
+    status = Column(Enum(ReportStatusEnum, values_callable=lambda obj: [e.value for e in obj]), default=ReportStatusEnum.PENDING, nullable=False, index=True, comment="Generation state")
+    file_path = Column(String(500), nullable=True, comment="Path to generated .xlsx file")
+    generated_at = Column(DateTime(timezone=True), nullable=True, comment="Generation completion timestamp")
+    generated_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, comment="User who triggered generation")
+    error_message = Column(Text, nullable=True, comment="Error message if status=error")
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False, comment="Row creation date")
+
+    __table_args__ = (
+        CheckConstraint("date_end >= date_start", name="chk_annual_date_order"),
+        Index("idx_annual_date_range", "date_start", "date_end"),
+        Index("idx_annual_status", "status"),
+    )
+
+    # backref (pas back_populates) : évite de devoir toucher la classe User pour exposer la
+    # relation inverse — user.annual_report_runs sera disponible automatiquement.
+    generated_by_user = relationship("User", backref="annual_report_runs")
+
+    def __repr__(self):
+        return (
+            f"<AnnualReportRun(id={self.id}, "
+            f"period={self.date_start}..{self.date_end}, status={self.status})>"
         )
 
 

@@ -2,6 +2,7 @@ import { useQuery, useMutation } from "@tanstack/react-query";
 import {
   fetchBoards,
   fetchProjects,
+  fetchSprintsInMonth,
   generateReport,
   fetchReportHistory,
   fetchTrelloBoards,
@@ -17,6 +18,15 @@ export const useProjects = (trelloBoardId) =>
     queryKey: ["projects", trelloBoardId],
     queryFn: () => fetchProjects(trelloBoardId),
     enabled: !!trelloBoardId,
+  });
+
+// Sprints suggérés pour board+projet+mois — se recalcule à chaque changement de l'un de
+// ces 4 paramètres (queryKey), enabled seulement quand les 4 sont renseignés.
+export const useSprintsInMonth = (trelloBoardId, projectLabelId, month, year) =>
+  useQuery({
+    queryKey: ["sprintsInMonth", trelloBoardId, projectLabelId, month, year],
+    queryFn: () => fetchSprintsInMonth(trelloBoardId, projectLabelId, month, year),
+    enabled: !!trelloBoardId && projectLabelId != null,
   });
 
 export const useGenerateReport = (trelloBoardId) =>
