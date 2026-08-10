@@ -1,5 +1,6 @@
 import { NavLink, useLocation } from "react-router-dom";
-import { FileSpreadsheet, CalendarRange, LayoutGrid, History, Settings, Layers, HelpCircle } from "lucide-react";
+import { FileSpreadsheet, CalendarRange, LayoutGrid, History, Settings, Layers, HelpCircle, LogOut } from "lucide-react";
+import { useAuth } from "../../auth/context/AuthContext";
 
 const nav = [
   { label: "Rapport mensuel", icon: FileSpreadsheet, to: "/" },
@@ -25,6 +26,7 @@ const WIDE_ROUTES = new Set(["/", "/rapport-annuel"]);
 
 export function AppShell({ children }) {
   const { pathname } = useLocation();
+  const { user, logout } = useAuth();
   const [section, page] = breadcrumbByPath[pathname] ?? ["Rapports", null];
   const maxWidthClass = WIDE_ROUTES.has(pathname) ? "max-w-6xl" : "max-w-5xl";
 
@@ -72,7 +74,7 @@ export function AppShell({ children }) {
         </NavLink>
       </aside>
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="sticky top-0 z-10 flex h-16 items-center border-b border-border bg-card/85 px-6 backdrop-blur">
+        <header className="sticky top-0 z-10 flex h-16 items-center justify-between border-b border-border bg-card/85 px-6 backdrop-blur">
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <span className="font-semibold text-foreground lg:hidden">TrendLabs</span>
             <span className="hidden lg:inline">{section}</span>
@@ -82,6 +84,22 @@ export function AppShell({ children }) {
                 <span className="hidden font-medium text-foreground lg:inline">{page}</span>
               </>
             )}
+          </div>
+          <div className="flex items-center gap-3">
+            {user && (
+              <span className="hidden text-sm text-muted-foreground sm:inline">
+                {user.full_name || user.email}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={logout}
+              title="Se déconnecter"
+              className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            >
+              <LogOut className="size-4" />
+              <span className="hidden sm:inline">Déconnexion</span>
+            </button>
           </div>
         </header>
         <main className="flex-1 px-6 py-10">

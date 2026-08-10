@@ -1,3 +1,5 @@
+import { apiFetch } from "./http";
+
 const BASE_URL = import.meta.env.VITE_API_URL;
 
 // Sprints couvrant la période choisie — alimente la checklist du formulaire, pré-cochée par
@@ -8,7 +10,7 @@ export async function fetchAnnualSprints(dateStart, dateEnd, boardIds) {
   url.searchParams.set("date_start", dateStart);
   url.searchParams.set("date_end", dateEnd);
   (boardIds || []).forEach((id) => url.searchParams.append("board_ids", String(id)));
-  const res = await fetch(url);
+  const res = await apiFetch(url);
   if (!res.ok) throw new Error("Impossible de charger les sprints de la période");
   const data = await res.json();
   return data.sprint_numbers;
@@ -18,7 +20,7 @@ export async function fetchAnnualSprints(dateStart, dateEnd, boardIds) {
 // tâche de fond côté backend et répond 202 immédiatement avec status="pending" — le front
 // doit ensuite poller fetchAnnualReportStatus (cf. useAnnualReportStatus).
 export async function generateAnnualReport(payload) {
-  const res = await fetch(`${BASE_URL}/api/reports/annual/generate`, {
+  const res = await apiFetch(`${BASE_URL}/api/reports/annual/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -31,13 +33,13 @@ export async function generateAnnualReport(payload) {
 }
 
 export async function fetchAnnualReportStatus(reportRunId) {
-  const res = await fetch(`${BASE_URL}/api/reports/annual/${reportRunId}`);
+  const res = await apiFetch(`${BASE_URL}/api/reports/annual/${reportRunId}`);
   if (!res.ok) throw new Error("Impossible de récupérer le statut du rapport");
   return res.json();
 }
 
 export async function downloadAnnualReport(reportRunId) {
-  const res = await fetch(`${BASE_URL}/api/reports/annual/${reportRunId}/download`);
+  const res = await apiFetch(`${BASE_URL}/api/reports/annual/${reportRunId}/download`);
   if (!res.ok) throw new Error("Fichier non disponible");
   const blob = await res.blob();
   const disposition = res.headers.get("Content-Disposition");
