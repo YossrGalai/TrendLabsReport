@@ -25,13 +25,16 @@ from openpyxl.utils import get_column_letter
 from openpyxl.formatting.rule import ColorScaleRule
 from sqlalchemy.orm import Session, joinedload
 
-from app.models.models import Board, Card, LabelTypeEnum
+from app.models.models import Board, Card, CardHistory, LabelTypeEnum, WorkflowStageEnum
 from app.services.excel.excel_service import (
     BACKLOG_STAGES,
     DEFAULT_OUTPUT_DIR,
     EXCLUDED_STAGES,
     ExcelReportService,
 )
+# ADAPTER si sync_service.py vit ailleurs — supposition basée sur le même pattern que
+# app.services.excel.excel_service (app.services.<domaine>.<domaine>_service).
+from app.services.sync.sync_service import PO_EXCLUDED_TRELLO_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -103,23 +106,25 @@ class AnnualReportService:
         - _group_by_label_type(cards, LabelTypeEnum.PROJECT) : regroupement par projet
           (au lieu de MODULE côté mensuel — la fonction est générique sur label_type)
         - _owner_list, _card_weekend_start_day : lecture des devs / jours week-end travaillés
+        - _card_active_days_in : IDENTIQUE au mensuel, y compris son comportement sur les
+          cartes encore ouvertes (completed_at=None -> zéro jour compté). Une variante
+          "_card_active_days_in_annual" avait été tentée à 3 reprises pour créditer le
+          travail en cours différemment — chaque tentative a réintroduit un bug plus subtil
+          que la précédente (jours calendaires présumés, card_history sans filtre d'acteur,
+          etc.), le tout pour finalement s'écarter de started_at/completed_at qui sont DÉJÀ
+          calculés avec les règles métier correctes par sync_service.py (priorité PR,
+          décalage 9h, exclusion PO). Verdict : la meilleure "correction" était de ne rien
+          réinventer et de réutiliser _card_active_days_in telle quelle.
         - _working_days_of_month(date_start, date_end, max_days=100_000) : liste des jours
           ouvrés de la période, EN DÉSACTIVANT le plafond GANTT_MAX_COLS (~23 jours) qui
           n'a de sens que pour la largeur physique de la grille Gantt du template mensuel —
           sur un an (~260 jours ouvrés), l'appeler avec le max_days par défaut tronquerait
-          silencieusement les totaux au premier mois. Voir _card_active_days_in_annual
-          ci-dessous pour le SEUL autre point d'adaptation nécessaire.
+          silencieusement les totaux au premier mois.
 
         PAS réutilisé (logique spécifique à l'annuel, écrite ci-dessous) :
         - fetch des cartes : _fetch_cards_for_sprints filtre par sprint_numbers ET par UN
           SEUL board ; ici on fetch par date sur PLUSIEURS boards, le filtre sprint (s'il est
           demandé) étant appliqué à part → _fetch_cards_for_board_in_period
-        - _card_active_days_in : retourne un set() si completed_at est None (carte encore
-          ouverte) — correct pour le mensuel (une carte ouverte "vit" jusqu'à la fin du mois
-          par construction du Gantt), mais insuffisant ici car aucune fenêtre d'affichage
-          équivalente n'existe → _card_active_days_in_annual, qui calcule une date de fin
-          effective (completed_at, ou la borne de fin demandée / aujourd'hui si plus tôt)
-          avant de réappliquer exactement la même boucle de dédup.
         - mise en page du classeur (_build_workbook) : le template Gantt mensuel n'a pas de
           sens pour une vue annuelle multi-projet ; nouvelle mise en page dédiée (vue
           d'ensemble + un onglet par projet).
@@ -148,9 +153,17 @@ class AnnualReportService:
                 project_boards.setdefault(project_name, set()).add(board.name)
                 dev_days = project_dev_days.setdefault(project_name, {})
                 for card in project_cards:
-                    owners = self._excel._owner_list(card) or ["(non assigné)"]
-                    active = self._card_active_days_in_annual(card, working_days, date_end)
+                    owners = self._real_actor_owners(card)
+                    active = self._excel._card_active_days_in(card, working_days)
                     weekend = self._excel._card_weekend_start_day(card, weekend_days)
+                    if active or weekend:
+                        # Diagnostic (temporaire) : détail par carte pour vérifier précisément
+                        # d'où viennent les jours comptés pour chaque dev.
+                        logger.info(
+                            f"📊 Carte '{card.name}' (id={card.id}) → {owners} : "
+                            f"actifs={sorted(active)} weekend={sorted(weekend)} "
+                            f"| started_at={card.started_at} completed_at={card.completed_at}"
+                        )
                     for owner in owners:
                         dev_days.setdefault(owner, set()).update(active)
                         if weekend:
@@ -189,7 +202,9 @@ class AnnualReportService:
         une carte chevauchant la borne de la période est simplement incluse, comme le fait
         déjà _filter_cards_active_in_period appliqué juste après par l'appelant).
         Le tri par started_at et le chargement joinedload(list/labels/members) suivent le
-        même pattern que _fetch_cards_for_sprints, pour les mêmes raisons (éviter le N+1)."""
+        même pattern que _fetch_cards_for_sprints, pour les mêmes raisons (éviter le N+1).
+        joinedload(Card.history).joinedload(CardHistory.to_list) : nécessaire pour
+        _real_actor_owners (attribution par acteur réel, spécifique à l'annuel)."""
         period_start_dt = datetime.combine(date_start, time.min)
         period_end_dt = datetime.combine(date_end, time.max)
         return (
@@ -198,6 +213,7 @@ class AnnualReportService:
                 joinedload(Card.list),
                 joinedload(Card.labels),
                 joinedload(Card.members),
+                joinedload(Card.history).joinedload(CardHistory.to_list),
             )
             .filter(Card.board_id == board_id)
             .filter(Card.started_at.isnot(None))
@@ -207,25 +223,56 @@ class AnnualReportService:
             .all()
         )
 
-    def _card_active_days_in_annual(self, card: Card, day_filter: set, period_end: date) -> set:
-        """Équivalent de ExcelReportService._card_active_days_in, mais tolère
-        completed_at=None (carte encore en cours en fin de période — décision produit :
-        on l'inclut, cf. échange projet) en la considérant active jusqu'à la borne de fin
-        de la période demandée (ou aujourd'hui si plus tôt, pour ne jamais compter de jours
-        futurs sur une carte toujours ouverte)."""
-        if not card.started_at:
-            return set()
-        start = card.started_at.date()
-        end = card.completed_at.date() if card.completed_at else min(period_end, date.today())
-        if end < start:
-            return set()
-        days = set()
-        current = start
-        while current <= end:
-            if current in day_filter:
-                days.add(current)
-            current += timedelta(days=1)
-        return days
+    # _card_active_days_in_annual a été supprimée : elle réinventait (mal, à 3 reprises) un
+    # calcul déjà résolu et éprouvé côté mensuel. generate_annual_report appelle désormais
+    # directement self._excel._card_active_days_in(card, working_days) — la même fonction,
+    # sur les mêmes started_at/completed_at déjà calculés par sync_service.py (priorité PR,
+    # décalage 9h, exclusion PO). Conséquence assumée : comme le mensuel, une carte encore
+    # ouverte (completed_at NULL) ne compte AUCUN jour, plutôt que d'estimer une activité en
+    # cours — cohérent avec la source de vérité plutôt qu'une règle maison supplémentaire.
+    # Si vous voulez malgré tout créditer le travail en cours sur des cartes non terminées,
+    # dites-le : ce sera une extension explicite, pas une réinvention silencieuse.
+
+    def _real_actor_owners(self, card: Card) -> TypingList[str]:
+        """Développeurs RÉELLEMENT crédités d'une carte — UNIQUEMENT pour l'annuel, ne
+        remplace PAS self._excel._owner_list (qui reste utilisée telle quelle par le
+        mensuel, comportement inchangé, décision explicite de ne pas les faire converger).
+
+        Contrairement à _owner_list (tous les membres assignés à la carte, qu'ils y aient
+        travaillé ou non — cf. cas remonté : un dev ajouté comme relecteur mais n'ayant fait
+        aucune action était crédité des mêmes jours que celui qui a réellement fait le
+        travail), on ne crédite ici que les personnes ayant RÉELLEMENT déplacé la carte vers
+        "En cours" (IN_PROGRESS).
+
+        Pourquoi pas l'auteur d'un PR séparément : sync_service.py a déjà tranché cette
+        question (cf. _infer_owners_for_unassigned_cards) — le memberCreator d'un
+        commentaire "PR #xxx created by ..." n'est PAS fiable (souvent un webhook Bitbucket
+        posté sous un autre compte), alors que l'acteur du déplacement vers IN_PROGRESS l'est
+        toujours. On réutilise donc ce même signal, déjà validé, plutôt que d'introduire une
+        deuxième source d'attribution moins fiable.
+
+        owner_trello_ids / exclusion PO : même filtre que sync_service.py._sync_card_dates
+        (relevant_history) — un acteur ne compte que s'il est un membre ACTUEL de la carte,
+        jamais le PO.
+
+        Cas sans acteur identifiable (carte sautée directement d'un backlog à un stage
+        terminé, sans jamais passer par IN_PROGRESS — cas prévu par sync_service.py) : repli
+        sur self._excel._owner_list, faute de signal fiable — mieux vaut créditer tous les
+        assignés que de faire disparaître silencieusement le travail du rapport."""
+        owner_trello_ids = {m.trello_id for m in card.members} - PO_EXCLUDED_TRELLO_IDS
+        actors = {
+            h.actor_full_name
+            for h in card.history
+            if h.to_list is not None
+            and h.to_list.workflow_stage == WorkflowStageEnum.IN_PROGRESS
+            and h.actor_trello_id
+            and h.actor_trello_id not in PO_EXCLUDED_TRELLO_IDS
+            and h.actor_trello_id in owner_trello_ids
+            and h.actor_full_name
+        }
+        if actors:
+            return sorted(actors)
+        return self._excel._owner_list(card) or ["(non assigné)"]
 
     def _fetch_and_clean_cards_by_board(
         self, db: Session, boards: TypingList[Board], date_start: date, date_end: date,
@@ -275,18 +322,34 @@ class AnnualReportService:
         """Pour l'endpoint qui alimente le sélecteur de sprints du front : la liste par
         défaut proposée à l'admin (cochée) avant qu'il ne la modifie éventuellement.
 
+        Mêmes 2 garde-fous que sprint_discovery_service.py (formulaire mensuel), pour rester
+        cohérent avec lui plutôt que de réinventer une 2e variante (cf. l'épisode
+        card_history sur le calcul des jours, revenu en arrière pour la même raison) :
+        1. Cartes fermées : chevauchement de dates simple (fenêtre bien définie).
+           Cartes encore ouvertes : en plus, exiger date_last_activity dans la période —
+           sinon une carte ouverte de longue date et oubliée reste "active" indéfiniment.
+        2. Sprint max par carte : une carte accumulant plusieurs labels SPRINT au fil du
+           temps (jamais nettoyés) ne compte que pour son sprint le plus récent.
+
         Retourne les sprint_number triés, tous boards confondus (un même sprint_number peut
         exister sur plusieurs boards, scopés indépendamment côté labels — mais le numéro en
         tant que tel est l'unité pertinente pour l'admin, qui raisonne "sprint 34", pas
         "sprint 34 du board X")."""
+        period_start_dt = datetime.combine(date_start, time.min)
+        period_end_dt = datetime.combine(date_end, time.max)
+
         boards = self._fetch_boards(db, board_ids)
         all_cards = self._fetch_and_clean_cards(db, boards, date_start, date_end)
-        sprint_numbers = {
-            l.sprint_number
-            for card in all_cards
-            for l in card.labels
-            if l.label_type == LabelTypeEnum.SPRINT and l.sprint_number is not None
-        }
+
+        sprint_numbers = set()
+        for card in all_cards:
+            card_sprints = [l.sprint_number for l in card.labels if l.label_type == LabelTypeEnum.SPRINT and l.sprint_number is not None]
+            if not card_sprints:
+                continue
+            if card.completed_at is None:
+                if not card.date_last_activity or not (period_start_dt <= card.date_last_activity <= period_end_dt):
+                    continue
+            sprint_numbers.add(max(card_sprints))
         return sorted(sprint_numbers)
 
     # ========================================================================
