@@ -2,13 +2,13 @@
 -- 1. DATABASE CREATION
 -- ============================================================================
 
-DROP DATABASE IF EXISTS trendlabs_db;
+DROP DATABASE IF EXISTS trendlabs;
 
-CREATE DATABASE trendlabs_db
+CREATE DATABASE trendlabs
   CHARACTER SET utf8mb4
   COLLATE utf8mb4_unicode_ci;
 
-USE trendlabs_db;
+USE trendlabs;
 
 -- ============================================================================
 -- 2. TRELLO TABLES — DATA SYNCHRONIZED FROM TRELLO
@@ -42,17 +42,18 @@ CREATE TABLE lists (
   board_id INT NOT NULL COMMENT 'Parent board',
   name VARCHAR(255) NOT NULL COMMENT 'Exact Trello name (ex: In Progress, Done this Sprint)',
   workflow_stage ENUM(
-    'product_backlog',
-    'sprint_backlog',
-    'in_progress',
-    'waiting_validation',
-    'done_sprint',
-    'done_preprod',
-    'in_prod',
-    'waiting',
-    'feedback',
-    'retrospective',
-    'other'
+    'PRODUCT_BACKLOG',
+    'SPRINT_BACKLOG',
+    'IN_PROGRESS',
+    'WAITING_QA',
+    'WAITING_VALIDATION',
+    'DONE_SPRINT',
+    'DONE_PREPROD',
+    'IN_PROD',
+    'WAITING',
+    'FEEDBACK',
+    'RETROSPECTIVE',
+    'OTHER'
   ) NOT NULL COMMENT 'Normalized workflow stage',
   position FLOAT NULL COMMENT 'List position in board',
   is_archived BOOLEAN DEFAULT FALSE COMMENT 'TRUE if archived in Trello',
@@ -135,8 +136,10 @@ CREATE TABLE cards (
 
   created_at DATETIME NULL COMMENT 'Real creation date (from createCard action)',
   started_at DATETIME NULL COMMENT 'First move to in_progress (REPORT START DATE)',
-  completed_at DATETIME NULL COMMENT 'Last move to done_* or in_prod (REPORT END DATE)',
+  completed_at DATETIME NULL COMMENT 'Last move to done_* or in_prod (REPORT END DATE), overridden by last_pr_comment_at when present',
   duration_working_days INT NULL COMMENT 'Working days (Mon-Fri) between started_at and completed_at',
+  duration_real_seconds INT NULL COMMENT 'Real duration in seconds, computed only from owner actions (excluding PO), started_at to completed_at',
+  last_pr_comment_at DATETIME NULL COMMENT 'Date of the last "PR #.. created by .." comment found on the card; takes priority over the list-move-based completed_at',
 
   synced_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'Last sync timestamp',
 
@@ -218,6 +221,8 @@ CREATE TABLE card_history (
   moved_at DATETIME NOT NULL COMMENT 'Exact event timestamp',
   action_trello_id VARCHAR(50) UNIQUE NOT NULL COMMENT 'Unique Trello action ID (idempotence key)',
   action_type ENUM('createCard', 'updateCard_list') NOT NULL COMMENT 'Action type',
+  actor_trello_id VARCHAR(50) NULL COMMENT 'Trello ID du memberCreator de l''action',
+  actor_full_name VARCHAR(255) NULL COMMENT 'Nom affiché de l''auteur (debug/audit)',
 
   FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE,
   FOREIGN KEY (from_list_id) REFERENCES lists(id) ON DELETE SET NULL,
@@ -226,6 +231,7 @@ CREATE TABLE card_history (
   INDEX idx_moved_at (moved_at),
   INDEX idx_action_type (action_type),
   INDEX idx_action_trello_id (action_trello_id),
+  INDEX idx_actor_trello_id (actor_trello_id),
   INDEX idx_card_history_card_date (card_id, moved_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='Card movement history (creation, list changes)';
@@ -286,12 +292,24 @@ CREATE TABLE users (
  * TABLE: report_runs
  * Role: History of each monthly Excel report generation
  * Allows accessing and regenerating previous reports
+ *
+ * Un rapport est désormais généré PAR PROJET (label Trello de type PROJECT), plus pour
+ * tout le board d'un coup : un board peut regrouper plusieurs projets, chacun avec son
+ * propre fichier .xlsx. D'où project_label_id (FK vers labels) et l'unicité recalculée
+ * sur (board_id, project_label_id, month, year) au lieu de (board_id, month, year) —
+ * sinon on ne pourrait générer qu'un seul rapport par board et par mois, tous projets
+ * confondus, ce qui contredirait excel_service.generate_monthly_report().
  */
 CREATE TABLE report_runs (
   id INT AUTO_INCREMENT PRIMARY KEY COMMENT 'Internal ID',
   board_id INT NOT NULL COMMENT 'Board this report concerns',
-  report_month TINYINT NOT NULL COMMENT 'Report month (1-12)',
+  project_label_id INT NOT NULL COMMENT 'PROJECT-type label this report concerns (labels.label_type = project)',
+  report_month TINYINT NOT NULL COMMENT 'Report month (1-12) — étiquette de classement, le contenu réel dépend de sprint_numbers',
   report_year SMALLINT NOT NULL COMMENT 'Report year (ex: 2026)',
+  -- Les 4 numéros de sprint couvrant ce mois de reporting (ex: [31, 32, 33, 34]).
+  -- Le filtrage réel des cartes se fait sur ces numéros (label SPRINT), pas sur des
+  -- bornes de dates calendaires — cf. ExcelReportService._fetch_cards_for_sprints().
+  sprint_numbers JSON NOT NULL COMMENT 'Les 4 numéros de sprint composant ce rapport',
   status ENUM('pending', 'running', 'done', 'error') NOT NULL DEFAULT 'pending' COMMENT 'Generation state',
   file_path VARCHAR(500) NULL COMMENT 'Path to generated .xlsx file',
   generated_at DATETIME NULL COMMENT 'Generation completion timestamp',
@@ -299,17 +317,21 @@ CREATE TABLE report_runs (
   error_message TEXT NULL COMMENT 'Error message if status=error',
 
   FOREIGN KEY (board_id) REFERENCES boards(id) ON DELETE CASCADE,
+  -- RESTRICT (et non CASCADE) : on ne veut pas qu'une suppression de label projet efface
+  -- silencieusement l'historique des rapports déjà générés pour ce projet.
+  FOREIGN KEY (project_label_id) REFERENCES labels(id) ON DELETE RESTRICT,
   FOREIGN KEY (generated_by) REFERENCES users(id) ON DELETE SET NULL,
   INDEX idx_board_id (board_id),
+  INDEX idx_project_label_id (project_label_id),
   INDEX idx_report_month_year (report_year, report_month),
   INDEX idx_status (status),
-  UNIQUE KEY uk_board_month_year (board_id, report_month, report_year),
+  UNIQUE KEY uk_board_project_month_year (board_id, project_label_id, report_month, report_year),
 
   CONSTRAINT chk_report_month CHECK (
     report_month >= 1 AND report_month <= 12
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  COMMENT='Excel report generation history';
+  COMMENT='Excel report generation history (1 ligne = 1 rapport pour 1 projet, 1 mois)';
 
 /**
  * TABLE: report_snapshots
@@ -327,3 +349,36 @@ CREATE TABLE report_snapshots (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   COMMENT='JSON snapshots of Trello data for report regeneration';
 
+
+
+/**
+ * TABLE: annual_report_runs
+ * Role: Historique de génération des rapports annuels
+ * Contrairement à report_runs (1 board + 1 projet + 1 mois), un rapport annuel couvre
+ * une plage de dates libre sur tous les boards (ou un sous-ensemble optionnel), tous
+ * projets confondus, avec un filtre sprint optionnel additionnel réglable par l'admin.
+ */
+CREATE TABLE annual_report_runs (
+  id INT AUTO_INCREMENT PRIMARY KEY COMMENT 'Internal ID',
+  date_start DATE NOT NULL COMMENT 'Début de la période demandée',
+  date_end DATE NOT NULL COMMENT 'Fin de la période demandée',
+  board_ids JSON NULL COMMENT 'Liste de boards.id inclus (NULL = tous les boards synchronisés)',
+  -- Traçabilité : contrairement à date_start/date_end (bornes), la liste de sprints
+  -- proposée par défaut (cf. AnnualReportService.list_sprints_in_period) peut être modifiée
+  -- par l'admin avant génération — on stocke la sélection FINALE utilisée, pas seulement
+  -- les bornes de dates, pour pouvoir reproduire ce run à l'identique plus tard.
+  sprint_numbers JSON NULL COMMENT 'Sprints effectivement inclus (NULL = filtre par dates uniquement, aucune restriction sprint)',
+  status ENUM('pending', 'running', 'done', 'error') NOT NULL DEFAULT 'pending' COMMENT 'Generation state',
+  file_path VARCHAR(500) NULL COMMENT 'Path to generated .xlsx file',
+  generated_at DATETIME NULL COMMENT 'Generation completion timestamp',
+  generated_by INT NULL COMMENT 'User who triggered generation (NULL if automatic)',
+  error_message TEXT NULL COMMENT 'Error message if status=error',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'Row creation date',
+
+  FOREIGN KEY (generated_by) REFERENCES users(id) ON DELETE SET NULL,
+  INDEX idx_date_range (date_start, date_end),
+  INDEX idx_status (status),
+
+  CONSTRAINT chk_annual_date_order CHECK (date_end >= date_start)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  COMMENT='Historique de génération des rapports annuels (multi-board, multi-projet, filtre sprint optionnel)';

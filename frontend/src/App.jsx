@@ -1,21 +1,43 @@
-import { useEffect, useState } from 'react'
-import axios from 'axios'
+import { Routes, Route } from "react-router-dom";
+import { AppShell } from "./features/reports/components/AppShell";
+import { ReportGeneratorForm } from "./features/reports/components/ReportGeneratorForm";
+import { AnnualReportGeneratorForm } from "./features/reports/components/AnnualReportGeneratorForm";
+import { SyncedBoardsPage } from "./features/boards/components/SyncedBoardsPage";
+import { HistoryPage } from "./features/reports/components/HistoryPage";
+import { DashboardPage } from "./features/dashboards/components/DashboardPage";
+import { SettingsPage } from "./features/settings/components/SettingsPage";
+import { LoginPage } from "./features/auth/components/LoginPage";
+import { RequireAuth } from "./features/auth/context/AuthContext";
 
 function App() {
-  const [status, setStatus] = useState('chargement...')
-
-  useEffect(() => {
-    axios.get('http://localhost:8000/health/db')
-      .then(res => setStatus(`${res.data.status} (db: ${res.data.database})`))
-      .catch(() => setStatus('erreur de connexion au backend'))
-  }, [])
-
   return (
-    <div style={{ padding: '2rem', fontFamily: 'sans-serif' }}>
-      <h1>TrendLabs Reporting Tool</h1>
-      <p>Statut backend : <strong>{status}</strong></p>
-    </div>
-  )
+    <Routes>
+      {/* Route publique — PAS enveloppée dans AppShell (pas de sidebar sur l'écran de
+          connexion) ni dans RequireAuth (sinon boucle infinie de redirection). */}
+      <Route path="/login" element={<LoginPage />} />
+
+      {/* Tout le reste passe par RequireAuth : redirige vers /login si pas connecté.
+          path="/*" + <Routes> imbriquées = pattern standard react-router v6 pour protéger
+          un groupe entier de routes existantes sans les modifier une par une. */}
+      <Route
+        path="/*"
+        element={
+          <RequireAuth>
+            <AppShell>
+              <Routes>
+                <Route path="/" element={<ReportGeneratorForm />} />
+                <Route path="/rapport-annuel" element={<AnnualReportGeneratorForm />} />
+                <Route path="/boards" element={<SyncedBoardsPage />} />
+                <Route path="/historique" element={<HistoryPage />} />
+                <Route path="/dashboard" element={<DashboardPage />} />
+                <Route path="/parametres" element={<SettingsPage />} />
+              </Routes>
+            </AppShell>
+          </RequireAuth>
+        }
+      />
+    </Routes>
+  );
 }
 
-export default App
+export default App;
