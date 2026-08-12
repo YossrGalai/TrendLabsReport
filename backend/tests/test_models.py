@@ -6,10 +6,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.database.db import engine, SessionLocal, Base
-from app.database.models import (
-    Board, List, Member, Label, Card, CardMember, CardLabel,
-    CardHistory, SyncLog, User, ReportRun, ReportSnapshot,
-    WorkflowStageEnum, LabelTypeEnum, ActionTypeEnum, SyncStatusEnum, ReportStatusEnum
+from models.models import (
+    Board, List, Member, Label, Card, CardHistory, WorkflowStageEnum, LabelTypeEnum, ActionTypeEnum, SyncStatusEnum, ReportStatusEnum
 )
 
 def test_connection():
